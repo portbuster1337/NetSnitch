@@ -237,31 +237,32 @@ public static class HttpIpc
     // Every meaningful field in a record - the metadata strings (user, process,
     // host:port, url) AND the full HTTP request/response blocks AND the bodies -
     // is stored as a u32 little-endian length followed by exactly that many bytes.
-    // Walk them with exact boundaries (no trailing binary leaks). The fixed
-    // preamble (chunk header, tag, identity blob) is skipped by resyncing 4 bytes
-    // at a time until a plausible, mostly-text length-prefixed field is found.
-    static bool IsText(byte c) { return (c >= 32 && c != 127) || c == 9 || c == 10 || c == 13; }
+    //
+    // The inter-field framing (length prefixes, the identity blob, the chunk
+    // header) always contains NUL bytes, while a real string field (HTTP text,
+    // host, URL, JSON/HTML body) never does. So: scan byte by byte for a
+    // length-prefixed run that is NUL-free and overwhelmingly printable. That
+    // alone keeps each field exact - no merges, no fragments, no trailing junk.
     public static string[] Fields(byte[] b, int total) {
         List<string> o = new List<string>();
         int p = 16;                                   // past the 16-byte chunk header
         while (p + 4 <= total) {
             uint len = (uint)(b[p] | (b[p+1] << 8) | (b[p+2] << 16) | (b[p+3] << 24));
-            if (len >= 1 && len <= (uint)(total - p - 4)) {
-                int sp = p + 4, text = 0, high = 0;
+            if (len >= 2 && len <= (uint)(total - p - 4) && len <= 0x20000) {
+                int sp = p + 4, printable = 0;
+                bool ok = true;
                 for (int k = 0; k < (int)len; k++) {
                     byte c = b[sp + k];
-                    if ((c >= 32 && c < 127) || c == 9 || c == 10 || c == 13) text++;
-                    else if (c >= 128) { text++; high++; }
+                    if (c == 0) { ok = false; break; }   // NUL => this is framing, not a string
+                    if ((c >= 32 && c != 127) || c == 9 || c == 10 || c == 13 || c >= 128) printable++;
                 }
-                // Accept as a string field only if it is overwhelmingly text and
-                // not just a run of high bytes (which would be a binary blob).
-                if (text * 100 >= (int)len * 85 && text > high) {
+                if (ok && printable * 100 >= (int)len * 80) {
                     o.Add(Encoding.UTF8.GetString(b, sp, (int)len));
                     p = sp + (int)len;
                     continue;
                 }
             }
-            p += 4;
+            p += 1;                                   // scan forward one byte and retry
         }
         return o.ToArray();
     }
@@ -388,60 +389,93 @@ if ($SelfTest) {
 # ---------------------------------------------------------------------------
 # Classify + print one record's text segments.
 # ---------------------------------------------------------------------------
+# A transaction spans several ring records (request record = tag 0, response
+# headers = tag 2, response body = tag 3+), all sharing a transaction id at
+# offset 0x14 of the record. We group by that id so concurrent connections do
+# not interleave, then print each transaction as one unit on idle / at the end.
+$script:txns = New-Object System.Collections.Specialized.OrderedDictionary
+$script:txn  = 0
+
 function Emit-Body([string]$label, [string]$text, [ConsoleColor]$color) {
-  $t = $text.Trim()
-  if ($t.Length -eq 0) { return }
+  $t = $text.TrimEnd()
+  if ($t.Trim().Length -eq 0) { return }
   $note = ''
   if ($TrimBody -gt 0 -and $t.Length -gt $TrimBody) {
-    $note = "  ... (+$($t.Length - $TrimBody) more bytes, use -TrimBody 0 for all)"
+    $note = "  ... (+$($t.Length - $TrimBody) more bytes; -TrimBody 0 shows all)"
     $t = $t.Substring(0, $TrimBody)
   }
   Write-Host "    $label" -ForegroundColor $color
   Write-Host ("        " + ($t -replace "`r?`n", "`n        ") + $note)
 }
 
-function Show-Segments([string[]]$segs, [ref]$txnRef) {
-  $meta = @{ proc=''; user=''; host=''; url='' }
-  $req = $null; $resp = $null; $bodies = @()
-  foreach ($t in $segs) {
-    $trim = $t.Trim()
-    if ($t -match '^[A-Z][A-Z]+ \S+ HTTP/\d')      { $req  = $t; continue }
-    if ($t -match '^HTTP/\d\S*\s+\d{3}')            { $resp = $t; continue }
-    if ($trim -match '^\d{1,3}(\.\d{1,3}){3}:\d+$') { $meta.host = $trim; continue }
-    if ($trim -match '^https?://')                  { $meta.url  = $trim; continue }
-    if ($trim -match '(?i)\.(exe|dll)$' -and $trim -notmatch '\s') { $meta.proc = $trim; continue }
-    if ($trim -eq $env:USERNAME)                    { $meta.user = $trim; continue }
-    if ($trim -match '^[\w.\-]{1,32}$' -and $meta.user -eq '') { $meta.user = $trim; continue }
-    $bodies += $t
-  }
-
-  if ($req) {
-    $txnRef.Value++
-    $parts = $req -split "`r`n`r`n", 2
-    Write-Host ''
-    Write-Host ("  #{0}  {1}{2}" -f $txnRef.Value, $meta.proc, $(if ($meta.user) { " ($($meta.user))" } else { '' })) -ForegroundColor White
-    if ($meta.url)  { Write-Host "       URL : $($meta.url)"  -ForegroundColor Gray }
-    if ($meta.host) { Write-Host "       Host: $($meta.host)" -ForegroundColor Gray }
+function Print-Txn($c) {
+  if (-not ($c.ReqHeaders -or $c.ResHeaders -or $c.ResBody -or $c.ReqBody)) { return }
+  Write-Host ''
+  $who = $c.Proc; if ($c.User) { $who += " ($($c.User))" }
+  if (-not $who) { $who = '(unknown process)' }
+  Write-Host ("  #{0}  {1}" -f $c.Num, $who) -ForegroundColor White
+  $line = @($c.Method, $c.Url) | Where-Object { $_ }
+  if ($line) { Write-Host ("       " + ($line -join ' ') + $(if ($c.Status) { "   ->  $($c.Status)" } else { '' })) -ForegroundColor Gray }
+  elseif ($c.Host) { Write-Host "       Host: $($c.Host)$(if ($c.Status) { "   ->  $($c.Status)" } else { '' })" -ForegroundColor Gray }
+  if ($c.ReqHeaders) {
     Write-Host '    > REQUEST HEADERS' -ForegroundColor Cyan
-    foreach ($ln in ($parts[0].TrimEnd() -split "`r?`n")) { Write-Host "        $ln" }
-    if ($parts.Count -gt 1) { Emit-Body '> REQUEST BODY' $parts[1] ([ConsoleColor]::Cyan) }
-    $script:phase = 'req'
+    foreach ($ln in ($c.ReqHeaders -split "`r?`n")) { Write-Host "        $ln" }
   }
-  if ($resp) {
-    $parts = $resp -split "`r`n`r`n", 2
+  if ($c.ReqBody.Length)  { Emit-Body '> REQUEST BODY'  $c.ReqBody  ([ConsoleColor]::Cyan) }
+  if ($c.ResHeaders) {
     Write-Host '    < RESPONSE HEADERS' -ForegroundColor Green
-    foreach ($ln in ($parts[0].TrimEnd() -split "`r?`n")) { Write-Host "        $ln" }
-    if ($parts.Count -gt 1) { Emit-Body '< RESPONSE BODY' $parts[1] ([ConsoleColor]::Green) }
-    $script:phase = 'resp'
+    foreach ($ln in ($c.ResHeaders -split "`r?`n")) { Write-Host "        $ln" }
   }
-  # Body-only records (large bodies arrive in their own records after the
-  # headers). Label them by which direction we are currently in.
-  foreach ($bd in $bodies) {
-    if ($script:phase -eq 'req') { Emit-Body '> REQUEST BODY' $bd ([ConsoleColor]::Cyan) }
-    else { Emit-Body '< RESPONSE BODY' $bd ([ConsoleColor]::Green) }
+  if ($c.ResBody.Length)  { Emit-Body '< RESPONSE BODY' $c.ResBody ([ConsoleColor]::Green) }
+}
+
+# Print and remove transactions that already have a response (complete). Called
+# after a short lull so each exchange appears promptly without being orphaned.
+function Flush-Ready {
+  foreach ($key in @($script:txns.Keys)) {
+    if ($script:txns[$key].ResHeaders -or $script:txns[$key].ResBody) {
+      Print-Txn $script:txns[$key]; $script:txns.Remove($key)
+    }
   }
 }
-$script:phase = ''
+function Flush-All {
+  foreach ($key in @($script:txns.Keys)) { Print-Txn $script:txns[$key] }
+  $script:txns.Clear()
+}
+
+function Ingest([string[]]$fields, [uint32]$id) {
+  $key = [string]$id
+  if ($script:txns.Contains($key)) { $t = $script:txns[$key] }
+  else {
+    $script:txn++
+    $t = @{ Num = $script:txn; Proc=''; User=''; Host=''; Url=''; Method='';
+            ReqHeaders=''; ReqBody=''; ResHeaders=''; ResBody=''; Status=''; SawResp=$false }
+    $script:txns[$key] = $t
+  }
+  foreach ($f in $fields) {
+    $trim = $f.Trim()
+    if ($f -match '^[A-Z][A-Z]+ \S+ HTTP/\d') {
+      $parts = $f -split "`r`n`r`n", 2
+      $t.ReqHeaders = $parts[0].TrimEnd(); $t.Method = ($f -split '\s+', 2)[0]
+      if ($parts.Count -gt 1 -and $parts[1]) { $t.ReqBody += $parts[1] }
+      continue
+    }
+    if ($f -match '^HTTP/\d\S*\s+\d{3}') {
+      $parts = $f -split "`r`n`r`n", 2
+      $t.ResHeaders = $parts[0].TrimEnd(); $t.SawResp = $true
+      if ($parts[0] -match '^HTTP/\S+\s+(\d{3}[^\r\n]*)') { $t.Status = $Matches[1].Trim() }
+      if ($parts.Count -gt 1 -and $parts[1]) { $t.ResBody += $parts[1] }
+      continue
+    }
+    if ($trim -match '^\d{1,3}(\.\d{1,3}){3}:\d+$') { if (-not $t.Host) { $t.Host = $trim }; continue }
+    if ($trim -match '^https?://')                  { if (-not $t.Url)  { $t.Url  = $trim }; continue }
+    if ($trim -match '(?i)\.(exe|dll)$' -and $trim -notmatch '\s') { if (-not $t.Proc) { $t.Proc = $trim }; continue }
+    if ($trim -eq $env:USERNAME)                    { if (-not $t.User) { $t.User = $trim }; continue }
+    if ($trim -match '^\d{1,4}$')                   { continue }    # bare status-code field
+    if ($trim -match '^[\w.\-]{1,24}$' -and -not $t.User) { $t.User = $trim; continue }
+    if ($t.SawResp) { $t.ResBody += $f } else { $t.ReqBody += $f }  # body chunk
+  }
+}
 
 # ---------------------------------------------------------------------------
 # Follow the publisher cursor and decode every new record.
@@ -450,34 +484,45 @@ Write-Host ''
 Write-Host "[reading] HTTP + HTTPS transactions$(if ($Seconds -gt 0) { " for ${Seconds}s" } else { ' (Ctrl+C to stop)' })" -ForegroundColor White
 
 $last = [uint32]::MaxValue
-$txn  = 0
 $stop = if ($Seconds -gt 0) { [DateTime]::UtcNow.AddSeconds($Seconds) } else { [DateTime]::MaxValue }
+$idle = 0
 try {
   while ([DateTime]::UtcNow -lt $stop) {
     $h = [HttpIpc]::ReadHeader($ring.Mem)
     if (-not $h.Valid) { Start-Sleep -Milliseconds 300; continue }
-    if ($h.WriteCursor -eq $last) { Start-Sleep -Milliseconds 120; continue }
-
+    if ($h.WriteCursor -eq $last) {
+      # Nothing new: flush completed exchanges after a short lull; flush whatever
+      # is left (e.g. a request whose response we never saw) after a longer one.
+      $idle += 120
+      if ($script:txns.Count) {
+        if ($idle -ge 360)  { Flush-Ready }
+        if ($idle -ge 1400) { Flush-All }
+      }
+      Start-Sleep -Milliseconds 120
+      continue
+    }
+    $idle = 0
     $from = if ($last -eq [uint32]::MaxValue) { $h.WriteCursor } else { $last + 1 }
     for ($seq = $from; $seq -le $h.WriteCursor; $seq++) {
       $slot = [uint32]($seq % $h.Capacity)
-      if ([HttpIpc]::SlotState($ring, $slot) -ne 2) { continue }
+      $st = [HttpIpc]::SlotState($ring, $slot)
+      if ($st -ne 2 -and $st -ne 3) { continue }     # 2=ready, 3=already consumed (data persists)
       $off = 0; $len = 0
       if (-not [HttpIpc]::SlotRange($ring, $slot, [ref]$off, [ref]$len)) { continue }
       $d = [HttpIpc]::RecordLen($ring, $off)
       if ($d -lt 16 -or $d -gt $len) { $d = [Math]::Min($len, 0x6000) }
       $raw = [HttpIpc]::ReadBytes($ring.Data, $off, $d)
+      $id = [uint32]([System.Runtime.InteropServices.Marshal]::ReadInt32($ring.Data, $off + 0x14))  # transaction id
       $segs = [HttpIpc]::Fields($raw, $raw.Length)
-      if ($segs.Count) {
-        $ref = [ref]$txn
-        Show-Segments $segs $ref
-        $txn = $ref.Value
-      }
+      if ($segs.Count) { Ingest $segs $id }
     }
+    # Flush transactions once the backlog grows, so long sessions stay bounded.
+    if ($script:txns.Count -ge 40) { Flush-All }
     $last = $h.WriteCursor
   }
 } finally {
+  Flush-All
   if ($owned) { try { $mutex.ReleaseMutex() } catch {} }
   Write-Host ''
-  Write-Host "[done] $txn transaction(s) shown" -ForegroundColor White
+  Write-Host "[done] $($script:txn) transaction(s) shown" -ForegroundColor White
 }
