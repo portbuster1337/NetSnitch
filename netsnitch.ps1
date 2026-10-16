@@ -37,7 +37,7 @@
 param(
   [int]$Seconds = 0,
   [int]$TrimBody = 0,        # 0 = show the whole body; >0 = trim each body to N chars
-  [string]$Server = '',     # collector URL, e.g. http://host:8771 - stream captures there as JSON
+  [string]$Server = '',     # collector URL, e.g. http://host:8771; streams captures there as JSON
   [switch]$NoInstall,
   [switch]$Uninstall,
   [switch]$SelfTest,        # generate a few HTTP/HTTPS requests so there is traffic to show
@@ -94,7 +94,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # ---------------------------------------------------------------------------
-# The reader / arming engine (shared memory only - no driver handle needed).
+# The reader / arming engine (shared memory only, no driver handle needed).
 # ---------------------------------------------------------------------------
 Add-Type -TypeDefinition @'
 using System;
@@ -244,15 +244,15 @@ public static class HttpIpc
         return s4 + "; " + s9 + "; " + s11 + "; " + s2;
     }
 
-    // Every meaningful field in a record - the metadata strings (user, process,
-    // host:port, url) AND the full HTTP request/response blocks AND the bodies -
+    // Every meaningful field in a record (the metadata strings: user, process,
+    // host:port, url; plus the full HTTP request/response blocks and the bodies)
     // is stored as a u32 little-endian length followed by exactly that many bytes.
     //
     // The inter-field framing (length prefixes, the identity blob, the chunk
     // header) always contains NUL bytes, while a real string field (HTTP text,
-    // host, URL, JSON/HTML body) never does. So: scan byte by byte for a
+    // host, URL, JSON/HTML body) never does. So scan byte by byte for a
     // length-prefixed run that is NUL-free and overwhelmingly printable. That
-    // alone keeps each field exact - no merges, no fragments, no trailing junk.
+    // alone keeps each field exact, with no merges, fragments, or trailing junk.
     public static string[] Fields(byte[] b, int total) {
         List<string> o = new List<string>();
         int p = 16;                                   // past the 16-byte chunk header
@@ -279,7 +279,7 @@ public static class HttpIpc
 
     // A body record (tag 1 request body / tag 3 response body) holds one
     // length-prefixed blob that runs to the end of the record (D+16). Pull the
-    // RAW bytes - no printable check - so compressed/binary bodies survive.
+    // RAW bytes (no printable check) so compressed/binary bodies survive.
     public static byte[] ExtractBody(byte[] b, int D) {
         int end = D + 16;
         if (end > b.Length) end = b.Length;
@@ -295,7 +295,7 @@ public static class HttpIpc
     }
 
     // Decode a body to text, transparently inflating gzip (magic 1f 8b) and
-    // zlib/deflate (magic 78 xx) - which is how servers compress responses.
+    // zlib/deflate (magic 78 xx), which is how servers compress responses.
     public static string DecodeBody(byte[] body) {
         if (body == null || body.Length == 0) return "";
         try {
@@ -320,7 +320,7 @@ public static class HttpIpc
     // them with the response, so a forward "read each slot once" reader loses the
     // race and misses most requests (leaving response-only orphans). Instead a
     // native background thread re-scans EVERY slot continuously and queues a slot's
-    // record whenever its content changes - which reliably catches the transient
+    // record whenever its content changes, which reliably catches the transient
     // request records. Grouping is by the transaction id at +0x14, which correlates
     // the request and response halves.
     //
@@ -453,9 +453,9 @@ if ($Persistence) {
   Step 'Installing reboot persistence'
   New-PersistenceTask
   # IMPORTANT: -Persistence only INSTALLS the boot task. It must NOT fall through
-  # into the foreground capture loop - doing so would arm the service and capture
+  # into the foreground capture loop. Doing so would arm the service and capture
   # in whatever session launched it, and if that session ends the armed capture is
-  # orphaned (breaks external traffic / spikes CPU). To also start capturing now,
+  # orphaned (breaks external traffic, spikes CPU). To also start capturing now,
   # combine with -Background (handled below). Otherwise we are done.
   if (-not $Background) {
     Write-Host '    capture will start automatically ~90s after each boot.' -ForegroundColor DarkGray
@@ -474,7 +474,7 @@ if ($Background) {
   # Spawn via WMI Win32_Process.Create, NOT Start-Process: a WMI-created process
   # is parented to WmiPrvSE and lives outside the launcher's job object/session,
   # so it survives the parent exiting (and survives the launching console/SSH
-  # session closing - Start-Process children get killed with that job object).
+  # session closing; Start-Process children get killed with that job object).
   $launched = $false
   try {
     $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cl } -ErrorAction Stop
@@ -686,7 +686,7 @@ function Flush-Settled([bool]$final) {
       if ($Server) { $send += $c }
       $script:txns.Remove($key)
     } elseif ($final -or (($now - $c.First) -ge $script:Grace)) {
-      $script:txns.Remove($key)                 # one-sided and out of time - drop it
+      $script:txns.Remove($key)                 # one-sided and out of time, drop it
     }
   }
   if ($Server -and $send.Count) { Send-Batch $send }
@@ -755,7 +755,7 @@ function Ingest-Body([uint32]$id, [int]$tag, [string]$text) {
 # ---------------------------------------------------------------------------
 # Deterministic per-machine id: a hash of stable system identifiers (the Windows
 # MachineGuid and the SMBIOS hardware UUID), so the same machine always maps to
-# the same agent - no duplicates, no saved-file dependency.
+# the same agent, with no duplicates and no saved-file dependency.
 function Get-AgentId {
   $parts = New-Object System.Collections.Generic.List[string]
   try {
@@ -780,7 +780,7 @@ function Get-AgentId {
 }
 
 # The agent's own uploads travel over HTTPS/443 and are themselves intercepted by
-# the capture - a feedback loop. We tag every upload three ways (destination host,
+# the capture, forming a feedback loop. We tag every upload three ways (destination host,
 # a request header, and a body sentinel) and drop any captured transaction that
 # matches, so our uploads are never re-sent or shown.
 $script:UploadMark = 'X-NetSnitch-Upload'
@@ -852,8 +852,8 @@ $dbytes = [long]$ring.DataBytes
 $stop   = if ($Seconds -gt 0) { [DateTime]::UtcNow.AddSeconds($Seconds) } else { [DateTime]::MaxValue }
 $flushAt = [DateTime]::UtcNow.AddMilliseconds(200)
 
-# For continuous (background/persistence) runs, drop this process - and the HTTP
-# service while it is armed - below normal priority. This is a hard safety net:
+# For continuous (background/persistence) runs, drop this process (and the HTTP
+# service while it is armed) below normal priority. This is a hard safety net:
 # even if traffic spikes the capture work, it can never starve the OS, sshd, or
 # other services, so the machine stays responsive and reachable. (Bounded
 # -Seconds runs stay at normal priority.)
