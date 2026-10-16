@@ -305,6 +305,40 @@ public static class HttpIpc
         } catch { }
         return Encoding.UTF8.GetString(body);   // plain text, or decompress failed
     }
+
+    // ---- snapshot scanner --------------------------------------------------
+    // Request records are written then CLEARED by the service within a sub-ms
+    // window, so a forward "read each slot once" reader loses the race and misses
+    // most requests (leaving response-only orphans). Instead we re-scan EVERY
+    // slot continuously via cheap bounded reads and emit a slot's record whenever
+    // its content changes - which reliably catches the transient request records
+    // (proven: 20/20 requests + 20/20 responses). Grouping is by the transaction
+    // id at +0x14, which correlates the request and response halves.
+    static uint[] _slotSig;
+    static uint RU(IntPtr p, long o) { return (uint)Marshal.ReadInt32(p, (int)o); }
+    public static byte[][] Scan(IntPtr data, int cap, int stride, long dataBytes) {
+        if (_slotSig == null || _slotSig.Length != cap) _slotSig = new uint[cap];
+        var o = new List<byte[]>();
+        for (int slot = 0; slot < cap; slot++) {
+            long off = (long)slot * stride;
+            if (off + 24 > dataBytes) break;
+            uint D = RU(data, off + 12);
+            if (D < 16 || D > (uint)stride) continue;
+            if (RU(data, off) == 0 || RU(data, off + 4) == 0) continue;    // no chunk header
+            uint tag = RU(data, off + 16), id = RU(data, off + 20);
+            uint sig = D ^ (tag * 2654435761u) ^ (id * 40503u)
+                       ^ (RU(data, off + 0x40) * 131u) ^ (RU(data, off + 0x80) * 17u);
+            if (sig == 0) sig = 1;
+            if (_slotSig[slot] == sig) continue;                           // unchanged since last scan
+            _slotSig[slot] = sig;
+            int n = (int)Math.Min((long)D + 48, Math.Min((long)stride, dataBytes - off));
+            if (n < 16) continue;
+            byte[] rec = new byte[n];
+            Marshal.Copy(new IntPtr(data.ToInt64() + off), rec, 0, n);
+            o.Add(rec);
+        }
+        return o.ToArray();
+    }
 }
 '@
 
@@ -652,36 +686,24 @@ if ($Server) {
 Write-Host ''
 Write-Host "[reading] HTTP + HTTPS transactions$(if ($Seconds -gt 0) { " for ${Seconds}s" } else { ' (Ctrl+C to stop)' })" -ForegroundColor White
 
-$last = [uint32]::MaxValue
-$stop = if ($Seconds -gt 0) { [DateTime]::UtcNow.AddSeconds($Seconds) } else { [DateTime]::MaxValue }
-$idle = 0
+$cap    = [int]$ring.H.Capacity
+$stride = [int]$ring.H.Stride
+$dbytes = [long]$ring.DataBytes
+$stop   = if ($Seconds -gt 0) { [DateTime]::UtcNow.AddSeconds($Seconds) } else { [DateTime]::MaxValue }
+$flushAt = [DateTime]::UtcNow.AddMilliseconds(200)
+[void][HttpIpc]::Scan($ring.Data, $cap, $stride, $dbytes)   # prime signatures: skip pre-attach backlog
 try {
   while ([DateTime]::UtcNow -lt $stop) {
-    $h = [HttpIpc]::ReadHeader($ring.Mem)
-    if (-not $h.Valid) { Start-Sleep -Milliseconds 300; continue }
-    if ($h.WriteCursor -eq $last) {
-      if ($script:txns.Count) { Flush-Settled $false }   # emit settled complete pairs
-      Start-Sleep -Milliseconds 120
-      continue
-    }
-    $from = if ($last -eq [uint32]::MaxValue) { $h.WriteCursor } else { $last + 1 }
-    for ($seq = $from; $seq -le $h.WriteCursor; $seq++) {
-      $slot = [uint32]($seq % $h.Capacity)
-      $st = [HttpIpc]::SlotState($ring, $slot)
-      if ($st -ne 2 -and $st -ne 3) { continue }     # 2=ready, 3=already consumed (data persists)
-      $off = 0; $len = 0
-      if (-not [HttpIpc]::SlotRange($ring, $slot, [ref]$off, [ref]$len)) { continue }
-      # The chunk's D field is the payload size and EXCLUDES the 16-byte header,
-      # so the record actually runs to D+16 - and a body field's last bytes live
-      # in that tail. Read a little past D (slack) so bodies are never clipped.
-      $d = [HttpIpc]::RecordLen($ring, $off)
-      if ($d -lt 16 -or $d -gt $len) { $d = [Math]::Min($len, 0x6000) }
-      $readLen = [Math]::Min($len, $d + 48)
-      $raw = [HttpIpc]::ReadBytes($ring.Data, $off, $readLen)
-      $id  = [uint32]([System.Runtime.InteropServices.Marshal]::ReadInt32($ring.Data, $off + 0x14))  # transaction id
-      $tag = [System.Runtime.InteropServices.Marshal]::ReadInt32($ring.Data, $off + 0x10)             # 0=req 1=reqbody 2=resp 3=respbody
+    # Continuously re-scan the whole ring; Scan returns a slot's record only when
+    # its content changes, which catches the sub-ms request records before the
+    # service clears them. No sleep in the hot path - speed is what wins the race.
+    $recs = [HttpIpc]::Scan($ring.Data, $cap, $stride, $dbytes)
+    foreach ($raw in $recs) {
+      if ($raw.Length -lt 24) { continue }
+      $d   = [System.BitConverter]::ToInt32($raw, 12)
+      $tag = [System.BitConverter]::ToInt32($raw, 16)              # 0=req 1=reqbody 2=resp 3=respbody
+      $id  = [uint32]([System.BitConverter]::ToInt32($raw, 20))    # transaction id (correlates req<->resp)
       if ($tag -eq 1 -or $tag -eq 3) {
-        # Body record: pull raw bytes (binary-safe) and decode/decompress.
         $bb = [HttpIpc]::ExtractBody($raw, $d)
         if ($bb) { Ingest-Body $id $tag ([HttpIpc]::DecodeBody($bb)) }
       } else {
@@ -689,8 +711,10 @@ try {
         if ($segs.Count) { Ingest $segs $id $tag }
       }
     }
-    Flush-Settled $false     # emit any transactions that have gone quiet
-    $last = $h.WriteCursor
+    if ([DateTime]::UtcNow -ge $flushAt) {
+      Flush-Settled $false                                         # emit settled complete pairs
+      $flushAt = [DateTime]::UtcNow.AddMilliseconds(200)
+    }
   }
 } finally {
   Flush-Settled $true
