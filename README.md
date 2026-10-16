@@ -281,9 +281,19 @@ $owned = $mutex.WaitOne(3000)
 ```
 
 Neither the mutex nor the commands alone start capture; together they do.
-**HTTPS is decrypted** because selector 4 installs `HTTP DEBUGGER CA for DEBUG ONLY`
-into `LocalMachine\Root` *before* the rules go live, so the service's MITM leaf is
-already trusted.
+
+**What each selector does** (and why the order is 4, 9, 11, 2):
+
+| Selector | Step | Effect |
+|---|---|---|
+| **4** | install CA | Adds `HTTP DEBUGGER CA for DEBUG ONLY` to `LocalMachine\Root`. Runs **first** so the MITM's leaf certificates are already trusted before any 443 traffic is intercepted; this is what makes HTTPS come out decrypted. |
+| **9** | build rules | Compiles the capture ruleset for ports 80 and 443 (from `settings.xml`) and loads it into the engine. |
+| **11** | apply rules | Activates the built rules, so the NetFilter driver starts redirecting matching TCP flows through the engine. |
+| **2** | user handshake | Sends the current username, completing the startup handshake the engine expects from the UI before it will publish transactions. |
+
+The ordering is load-bearing: the CA must be trusted **before** 443 is tapped (4
+before 9/11), rules must be built before they can be applied (9 before 11), and the
+engine only begins emitting records after the user handshake (2 last).
 
 ### 4. Reading: the snapshot pump
 
