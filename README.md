@@ -86,31 +86,54 @@ filters), or kill the process and `sc stop HTTPDebuggerPro`. Simply killing the
 capture process while it is armed leaves the driver's 80/443 filters in place
 until the service is stopped or the machine reboots.
 
-## Central collector (optional)
+## Central collector (`server.py`)
 
-Run `server.py` on any machine to collect captures from many agents and browse
-them in a web UI (Python 3, standard library only):
+`server.py` is an optional receiving server: run it on any machine to collect
+captures streamed from one or more agents and browse them in a web UI. It is
+**pure Python 3 standard library** — no pip installs — and stores everything in
+**SQLite**.
 
 ```bash
+# start the collector (prints a one-time login password on startup)
 python3 server.py --port 8771
+
+# pick the bind address, database file, and a fixed password
+python3 server.py --host 0.0.0.0 --port 8771 --data captures.db --password s3cret
 ```
 
-It prints a **one-time login password** and stores everything in **SQLite**
-(`captures.db`). Point agents at it:
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--host`     | `0.0.0.0` | Bind address |
+| `--port`     | `8771` | Listen port |
+| `--data`     | `captures.db` | SQLite database file (created if missing) |
+| `--password` | random | Login password; if omitted, a one-time password is generated and printed |
+
+Then point any number of agents at it (continuously / at boot, if you like):
 
 ```powershell
 .\netsnitch.ps1 -Server http://<collector-host>:8771
+.\netsnitch.ps1 -Background  -Server http://<collector-host>:8771
+.\netsnitch.ps1 -Persistence -Server http://<collector-host>:8771
 ```
 
-- Each machine is identified by a **stable agent id** (a hash of its MachineGuid +
-  SMBIOS UUID), so re-runs never create duplicate agents.
-- The home page lists agents; click one to see its captures. Each entry shows the
-  **site's favicon** (fetched and cached by the server), method, URL, status,
-  process and time, and expands to the full request/response headers and bodies.
-- Only complete request+response pairs are shown; the agent's own uploads and
-  one-sided/orphan records are filtered out.
+**Behaviour**
 
-Server options: `--host`, `--port`, `--data <sqlite file>`, `--password <pw>`.
+- **One-time login.** On startup the server prints the password; the web UI gates
+  everything behind it (cookie session). The `/api/ingest` upload endpoint is open
+  so agents don't need the password.
+- **Stable agent id.** Each machine is identified by a hash of its MachineGuid +
+  SMBIOS UUID, so re-runs/reboots never create duplicate agents.
+- **Web UI.** The home page lists agents; click one to see its captures. Each entry
+  shows the site's **favicon** (fetched + cached server-side), method, URL, status,
+  process and time, and expands to the full request/response headers and bodies.
+  The view refreshes incrementally (preserves scroll and open rows).
+- **Clean data.** Only complete request+response pairs are shown; the agent's own
+  uploads and one-sided/orphan records are filtered out.
+
+**HTTP endpoints** (for reference): `GET /` and `/agent/<id>` (UI), `GET /login`
+`/logout`, `POST /login`; JSON API `GET /api/agents`, `GET /api/agent/<id>?since=<ts>`,
+`POST /api/agent` (register), `POST /api/ingest` (upload batch), and `GET /fav?h=<host>`
+(favicon proxy).
 
 ## Architecture
 
@@ -120,6 +143,33 @@ buffers** (plus a few named events and a mutex) in the kernel `Global\` object
 namespace. NetSnitch impersonates the GUI by opening those exact objects itself.
 There is **no driver handle and no service API**: everything is `kernel32`
 file-mapping calls via P/Invoke.
+
+```mermaid
+flowchart LR
+    subgraph agent["netsnitch.ps1 (admin)"]
+        arm["arm: hold mutex +<br/>push selectors 4,9,11,2"]
+        pump["snapshot pump<br/>native thread, ~1 kHz"]
+        dec["decode: fields by u32 len,<br/>group by id, inflate bodies"]
+    end
+
+    subgraph ipc["Global#92; shared memory (file mappings)"]
+        mutex(["HttpDebuggerUiStarted<br/>(mutex)"])
+        cmd["EngineCommand ring<br/>script → service"]
+        txn["HttpTransaction ring<br/>service → script"]
+    end
+
+    subgraph svc["HTTPDebuggerSvc.exe + CtrlSM.sys"]
+        engine["capture engine<br/>MITM 80/443, decrypt TLS"]
+    end
+
+    arm -- "WaitOne()" --> mutex
+    arm -- "write record + SetEvent(_evt_filled)" --> cmd
+    cmd --> engine
+    mutex -. "UI-present gate" .-> engine
+    engine == "16-byte chunk + length-prefixed fields" ==> txn
+    txn -- "re-scan slots, dedup by content sig" --> pump --> dec
+    dec -. "-Server: JSON over HTTP" .-> server[("server.py<br/>SQLite + web UI")]
+```
 
 ### 1. IPC surface
 
