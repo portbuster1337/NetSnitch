@@ -43,7 +43,8 @@ param(
   [switch]$Uninstall,
   [switch]$SelfTest,        # generate a few HTTP/HTTPS requests so there is traffic to show
   [switch]$Background,      # detach and run continuously in a hidden process, then return
-  [switch]$Persistence      # install a scheduled task that starts capture at every boot
+  [switch]$Persistence,     # install a scheduled task that starts capture at every boot
+  [switch]$DebugRing        # diagnosis: dump every raw ring record and every drop decision
 )
 
 $ErrorActionPreference = 'Continue'
@@ -93,12 +94,13 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
   if ($SelfTest)   { $a += '-SelfTest' }
   if ($Background) { $a += '-Background' }
   if ($Persistence){ $a += '-Persistence' }
+  if ($DebugRing)  { $a += '-DebugRing' }
   Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $a
   return
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.17.8'
+$NetSnitchBuild = '2026.10.17.9'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -489,6 +491,7 @@ if ($Persistence -and -not $Background) {
 # printed anywhere. (With -Persistence it also installs the boot task, quietly.)
 if ($Background) {
   if ($Persistence) { New-PersistenceTask *>$null }
+  if ($DebugRing) { Warn '-DebugRing has no effect with -Background (all output is discarded); run it foreground' }
   # Invoke via -Command (not -File) so we can append "*> $null" and swallow ALL
   # output. Single-quote the paths/URL so spaces are safe inside the command.
   $inner = "& '$PSCommandPath' -Seconds 0"
@@ -702,6 +705,30 @@ function Print-Txn($c) {
 
 function Now-Ms { [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) }
 
+# -DebugRing: print every raw ring record plus every drop decision, so a single
+# run on an affected machine proves whether 443 records arrive at all and where
+# they die. Counters are cheap; the per-record [dbg] lines are the instrument.
+$script:DbgTagCounts = @{}
+$script:DbgNoFields  = 0
+$script:DbgNullBody  = 0
+$script:DbgHttpsish  = 0
+$script:DbgLastBeat  = Now-Ms
+
+function Show-RingRecord($raw, $tag, $id, $d) {
+  $n  = [Math]::Min(140, $raw.Length - 16)
+  $sb = New-Object System.Text.StringBuilder
+  for ($i = 16; $i -lt 16 + $n; $i++) {
+    $c = [int]$raw[$i]
+    if ($c -ge 32 -and $c -lt 127) { [void]$sb.Append([char]$c) } else { [void]$sb.Append('.') }
+  }
+  $s = $sb.ToString() -replace '\.{3,}', '..'
+  Write-Host ("[dbg] {0} tag={1} id={2} D={3} len={4} | {5}" -f `
+    ([DateTime]::UtcNow.ToString('HH:mm:ss.fff')), $tag, $id, $d, $raw.Length, $s) -ForegroundColor DarkGray
+  if (-not $script:DbgTagCounts.ContainsKey($tag)) { $script:DbgTagCounts[$tag] = 0 }
+  $script:DbgTagCounts[$tag]++
+  if ($s -match 'https://|:443|CONNECT|:method|:status') { $script:DbgHttpsish++ }
+}
+
 # A transaction's records arrive as a burst, but a request and its response can be
 # seconds apart on long-lived connections. So: hold each transaction until it has
 # gone quiet (SETTLE ms since its last record), then emit it ONLY if it is a
@@ -732,7 +759,10 @@ function Flush-Settled([bool]$final) {
   $send = @()
   foreach ($key in @($script:txns.Keys)) {
     $c = $script:txns[$key]
-    if ($Server -and (Is-ServerTxn $c)) { $script:txns.Remove($key); continue }
+    if ($Server -and (Is-ServerTxn $c)) {
+      if ($DebugRing) { Write-Host ("[dbg] drop #{0} self-upload | {1}" -f $c.Num, $c.Url) -ForegroundColor DarkYellow }
+      $script:txns.Remove($key); continue
+    }
     $hasReq  = [bool]($c.Method -or $c.Url -or $c.ReqHeaders)
     $hasResp = [bool]($c.ResHeaders -or $c.ResBody -or $c.Status)
     $quiet   = ($now - $c.Updated) -ge $script:Settle
@@ -740,9 +770,18 @@ function Flush-Settled([bool]$final) {
       if (Test-DomainMatch $c) {                # -Domains filter (no-op when empty)
         Print-Txn $c
         if ($Server) { $send += $c }
+      } elseif ($DebugRing) {
+        Write-Host ("[dbg] drop #{0} domain | {1}" -f $c.Num, $c.Url) -ForegroundColor DarkYellow
       }
       $script:txns.Remove($key)
     } elseif ($final -or (($now - $c.First) -ge $script:Grace)) {
+      if ($DebugRing) {
+        $why = if (-not $hasReq) { 'no-req' } elseif (-not $hasResp) { 'no-resp' } else { 'grace' }
+        if ($final) { $why = 'final-' + $why }
+        $pv = $c.Url; if (-not $pv) { $pv = $c.Host }; if (-not $pv) { $pv = $c.Method }
+        if ($pv -and $pv.Length -gt 90) { $pv = $pv.Substring(0, 90) }
+        Write-Host ("[dbg] {0} drop #{1} {2} | {3}" -f ([DateTime]::UtcNow.ToString('HH:mm:ss.fff')), $c.Num, $why, $pv) -ForegroundColor DarkYellow
+      }
       $script:txns.Remove($key)                 # one-sided and out of time, drop it
     }
   }
@@ -984,6 +1023,7 @@ if ($Server) {
 Write-Host ''
 Write-Host "[reading] HTTP + HTTPS transactions$(if ($Seconds -gt 0) { " for ${Seconds}s" } else { ' (Ctrl+C to stop)' })" -ForegroundColor White
 if ($script:Domains.Count) { Write-Host "    domain filter: only $($script:Domains -join ', ')" -ForegroundColor DarkGray }
+if ($DebugRing) { Write-Host '    debug: dumping every raw ring record ([dbg] lines)' -ForegroundColor DarkGray }
 
 $cap    = [int]$ring.H.Capacity
 $stride = [int]$ring.H.Stride
@@ -1012,23 +1052,39 @@ try {
       $d   = [System.BitConverter]::ToInt32($raw, 12)
       $tag = [System.BitConverter]::ToInt32($raw, 16)              # 0=req 1=reqbody 2=resp 3=respbody
       $id  = [uint32]([System.BitConverter]::ToInt32($raw, 20))    # transaction id (correlates req<->resp)
+      if ($DebugRing) { Show-RingRecord $raw $tag $id $d }
       if ($tag -eq 1 -or $tag -eq 3) {
         $bb = [HttpIpc]::ExtractBody($raw, $d)
         if ($bb) { Ingest-Body $id $tag ([HttpIpc]::DecodeBody($bb)) }
+        elseif ($DebugRing) { $script:DbgNullBody++ }
       } else {
         $segs = [HttpIpc]::Fields($raw, $raw.Length)
         if ($segs.Count) { Ingest $segs $id $tag }
+        elseif ($DebugRing) { $script:DbgNoFields++ }
       }
     }
     if ([DateTime]::UtcNow -ge $flushAt) {
       Flush-Settled $false                                         # emit settled complete pairs
       $flushAt = [DateTime]::UtcNow.AddMilliseconds(200)
+      if ($DebugRing -and ((Now-Ms - $script:DbgLastBeat) -ge 5000)) {
+        $tot = 0; foreach ($v in $script:DbgTagCounts.Values) { $tot += $v }
+        Write-Host ("[dbg] {0} records={1} httpsish={2} no-fields={3} body-null={4} open-txns={5}" -f `
+          ([DateTime]::UtcNow.ToString('HH:mm:ss')), $tot, $script:DbgHttpsish, $script:DbgNoFields, $script:DbgNullBody, $script:txns.Count) -ForegroundColor DarkGray
+        $script:DbgLastBeat = Now-Ms
+      }
     }
     Start-Sleep -Milliseconds 150                                  # drain cadence; the pump thread does the fast work
   }
 } finally {
   [HttpIpc]::StopPump()
   Flush-Settled $true
+  if ($DebugRing) {
+    $parts = @()
+    foreach ($k in ($script:DbgTagCounts.Keys | Sort-Object)) { $parts += "tag$k=$($script:DbgTagCounts[$k])" }
+    if (-not $parts.Count) { $parts = @('none') }
+    Write-Host ("[dbg] ring records: {0} | httpsish={1} no-fields={2} body-null={3}" -f `
+      ($parts -join ' '), $script:DbgHttpsish, $script:DbgNoFields, $script:DbgNullBody) -ForegroundColor DarkGray
+  }
   if ($owned) { try { $mutex.ReleaseMutex() } catch {} }
   Write-Host ''
   Write-Host "[done] $($script:txn) transaction(s) shown" -ForegroundColor White
