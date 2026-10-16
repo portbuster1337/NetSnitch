@@ -1,4 +1,4 @@
-# HttpCapture
+# NetSnitch
 
 Headless HTTP/HTTPS traffic capture on Windows, driven entirely from a single
 PowerShell script. It installs the HTTPDebugger capture service + its network
@@ -10,7 +10,7 @@ HTTPS in the clear.
 
 | File | Purpose |
 |------|---------|
-| `HttpCapture.ps1`   | Installer + headless activator + live reader (the agent) |
+| `netsnitch.ps1`   | Installer + headless activator + live reader (the agent) |
 | `HTTPDebuggerSvc.exe`| The capture service (intercepts via a WFP/NetFilter driver) |
 | `CtrlSM.sys`        | The network filter driver the service registers |
 | `server.py`         | Optional collector server + web UI (receives captures from agents) |
@@ -27,32 +27,32 @@ Run from an elevated prompt (or let it elevate itself):
 
 ```powershell
 # Install the service + driver, arm capture, and stream transactions until Ctrl+C
-.\HttpCapture.ps1
+.\netsnitch.ps1
 
 # Capture for a fixed number of seconds
-.\HttpCapture.ps1 -Seconds 60
+.\netsnitch.ps1 -Seconds 60
 
 # Service already installed and running - just arm + read
-.\HttpCapture.ps1 -NoInstall
+.\netsnitch.ps1 -NoInstall
 
 # Generate a few sample HTTP/HTTPS requests so there is something to show
-.\HttpCapture.ps1 -SelfTest -Seconds 30
+.\netsnitch.ps1 -SelfTest -Seconds 30
 
 # Trim long bodies to N characters (default 0 = show the whole body)
-.\HttpCapture.ps1 -TrimBody 2000
+.\netsnitch.ps1 -TrimBody 2000
 
 # Run continuously in a hidden background process (returns immediately)
-.\HttpCapture.ps1 -Background -Server http://<collector-host>:8771
+.\netsnitch.ps1 -Background -Server http://<collector-host>:8771
 
 # Start automatically ~90s after every boot (installs a SYSTEM scheduled task)
-.\HttpCapture.ps1 -Persistence -Server http://<collector-host>:8771
+.\netsnitch.ps1 -Persistence -Server http://<collector-host>:8771
 
 # Install the boot task AND start capturing now, in the background
-.\HttpCapture.ps1 -Persistence -Background -Server http://<collector-host>:8771
+.\netsnitch.ps1 -Persistence -Background -Server http://<collector-host>:8771
 
 # Stop everything cleanly (kills background capture, removes the task,
 # stops the service so the driver filters are released and traffic is normal)
-.\HttpCapture.ps1 -Uninstall
+.\netsnitch.ps1 -Uninstall
 ```
 
 ### Parameters
@@ -99,7 +99,7 @@ It prints a **one-time login password** and stores everything in **SQLite**
 (`captures.db`). Point agents at it:
 
 ```powershell
-.\HttpCapture.ps1 -Server http://<collector-host>:8771
+.\netsnitch.ps1 -Server http://<collector-host>:8771
 ```
 
 - Each machine is identified by a **stable agent id** (a hash of its MachineGuid +
@@ -112,33 +112,126 @@ It prints a **one-time login password** and stores everything in **SQLite**
 
 Server options: `--host`, `--port`, `--data <sqlite file>`, `--password <pw>`.
 
-## How it works
+## Architecture
 
-The service only captures while it believes its UI is present and has issued the
-"start capture" commands. `HttpCapture.ps1` reproduces that handshake headlessly:
+`HTTPDebuggerSvc.exe` normally only captures while its GUI is running. The GUI and
+the service don't talk over a socket or RPC — they share **named memory-mapped ring
+buffers** (plus a few named events and a mutex) in the kernel `Global\` object
+namespace. NetSnitch impersonates the GUI by opening those exact objects itself.
+There is **no driver handle and no service API**: everything is `kernel32`
+file-mapping calls via P/Invoke.
 
-1. **Install** — copies `CtrlSM.sys` to `drv2\x64\netfilter2.sys` /
-   `drv2\win32\netfilter2.sys`, writes the rules profile to
-   `%ProgramData%\HTTPDebuggerPro\settings.xml`, runs `HTTPDebuggerSvc.exe /install`
-   (which registers the service and generates the TLS root CA), and starts the
-   service.
+### 1. IPC surface
 
-2. **Arm (the headless trick)** —
-   - acquires ownership of the mutex `Global\HttpDebuggerUiStarted` so the engine
-     worker believes the UI is live, **and**
-   - writes the UI's own command sequence into the `EngineCommand` shared-memory
-     ring: selectors **4, 9, 11, 2** — install the CA, build the port 80/443
-     filter rules, apply/activate them, and the user handshake.
+Each logical channel is a pair/group of mappings named `<base>_mem` (a small
+header) and `<base>_data_<N>` (the slot storage), coordinated by a `<base>_evt_*`
+event. The objects NetSnitch uses:
 
-   Neither the mutex nor the commands alone start capture; **together** they do.
+| Object (`Global\…`) | Kind | Direction | Role |
+|---|---|---|---|
+| `HttpDebuggerUiStarted` | mutex | — | "the UI is live" gate |
+| `HttpDebuggerIpcEngineCommand_{mem,data_0,evt_filled}` | ring + event | script → service | issue control commands |
+| `HttpDebuggerIpcHttpTransaction_{mem,data_N}` | ring | service → script | captured transactions |
 
-3. **Read** — follows the publisher cursor in the `HttpTransaction` shared-memory
-   ring (read-only, non-destructive) and decodes each record's length-prefixed
-   fields into process / host / URL / request / response blocks.
+Opening a mapping is just `OpenFileMappingA` + `MapViewOfFile`:
 
-HTTPS is decrypted because selector 4 installs `HTTP DEBUGGER CA for DEBUG ONLY`
-into `LocalMachine\Root` **before** the rules go live, so the service's
-man-in-the-middle presents a leaf certificate the OS already trusts.
+```csharp
+[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Ansi)]
+static extern IntPtr OpenFileMappingA(uint access, bool inherit, string name);
+[DllImport("kernel32.dll", SetLastError=true)]
+static extern IntPtr MapViewOfFile(IntPtr h, uint access, uint hi, uint lo, UIntPtr bytes);
+
+static IntPtr Map(string name, UIntPtr bytes, uint access) {
+    IntPtr h = OpenFileMappingA(access, false, name);      // e.g. "Global\\…HttpTransaction_mem"
+    if (h == IntPtr.Zero) return IntPtr.Zero;
+    IntPtr p = MapViewOfFile(h, access, 0, 0, bytes);
+    CloseHandle(h);
+    return p;                                              // read/write directly at this pointer
+}
+```
+
+### 2. Ring + record layout
+
+The `_mem` header is a struct of `uint`s: `capacity@0x00`, `writeCursor@0x04`,
+`readCursor@0x08`, `stride@0x18` (always `0x6000`), `total@0x1C` (= capacity ×
+stride). The `_data` region is `capacity` fixed `0x6000`-byte **slots**. Every slot
+begins with a 16-byte **chunk header**, then a payload:
+
+```
+slot:  +0x00 magic/state words   +0x0C D = payload size (EXCLUDES the 16-byte header)
+       +0x10 tag                 +0x14 transaction id
+       +0x20… payload: a sequence of  [u32 little-endian length][that many bytes]
+tag =  0 request · 1 request body · 2 response · 3 response body
+```
+
+A full transaction is several records sharing one `id@0x14`; the record's real end
+is `D + 16`.
+
+### 3. Arming headlessly
+
+Capture needs **both** the mutex held *and* the GUI's startup command sequence —
+selectors **4, 9, 11, 2** (install CA → build 80/443 rules → apply → user
+handshake). Each command is one record written into the EngineCommand ring: fill
+the chunk header, put the selector at `+0x10`, flip the slot's state word to
+`READY`, bump `writeCursor`, and pulse the "filled" event so the service wakes:
+
+```csharp
+BitConverter.GetBytes(selector).CopyTo(rec, 16);           // selector at +0x10
+Marshal.Copy(rec, 0, p, rec.Length);                       // write the record
+Marshal.WriteInt32(p, (int)SLOT_STRIDE, 2);                // slot state = READY
+// … bump writeCursor in _mem, then:
+SetEvent(OpenEventA(EVENT_ALL, false, b + "_evt_filled")); // service processes it
+```
+
+```powershell
+# the script holds the mutex (poses as the UI) around the whole arm
+$mutex = [System.Threading.Mutex]::OpenExisting('Global\HttpDebuggerUiStarted')
+$owned = $mutex.WaitOne(3000)
+[HttpIpc]::ArmCapture($env:USERNAME)   # pushes selectors 4,9,11,2 with short settles
+```
+
+Neither the mutex nor the commands alone start capture; together they do.
+**HTTPS is decrypted** because selector 4 installs `HTTP DEBUGGER CA for DEBUG ONLY`
+into `LocalMachine\Root` *before* the rules go live, so the service's MITM leaf is
+already trusted.
+
+### 4. Reading: the snapshot pump
+
+The naive reader — follow `writeCursor` and read each new slot once — **misses most
+requests**. The service writes a request record, then *clears that slot* shortly
+after it pairs the request with its response internally; a cursor reader that reads
+each slot a single time loses the race and is left with response-only orphans.
+
+The fix is to stop chasing the cursor and instead **continuously re-scan every
+slot**, emitting a slot's record whenever its content *changes* (deduped by a cheap
+content signature). That reliably catches the short-lived request records. It runs
+on a native background thread so it doesn't block the PowerShell pipeline, sleeps
+1 ms between passes, and runs below-normal priority — ~0.2 % of one core, versus a
+no-sleep loop that would pin a whole core:
+
+```csharp
+while (_pumpRun) {
+    for (int slot = 0; slot < cap; slot++) {
+        uint D = RU(data, off + 12); if (D < 16) continue;             // empty slot
+        uint sig = D ^ tag*2654435761u ^ id*40503u ^ …;                // content signature
+        if (_slotSig[slot] == sig) continue;                           // unchanged → skip
+        _slotSig[slot] = sig;
+        _pumpQ.Enqueue(CopyRecord(off, D));                            // new record → queue
+    }
+    Thread.Sleep(1);                                                   // ~1 kHz, tiny CPU
+}
+```
+
+PowerShell drains the queue, groups records by `id@0x14`, and decodes each one.
+
+### 5. Decoding a record
+
+Framing (length prefixes, the chunk header, the identity blob) always contains NUL
+bytes; real string fields (HTTP headers, URL, host, JSON/HTML bodies) never do. So
+field extraction scans for a `u32`-length-prefixed run that is NUL-free and ≥ 80 %
+printable — which isolates each field exactly, with no merges or trailing junk.
+Body records (tags 1/3) are pulled as **raw** bytes (no printable filter) so binary
+payloads survive, then gzip/deflate is inflated by magic bytes.
 
 ## Output
 

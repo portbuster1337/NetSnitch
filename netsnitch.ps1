@@ -6,7 +6,7 @@
 
 .DESCRIPTION
   Three files, no GUI, fully scripted:
-    HttpCapture.ps1, HTTPDebuggerSvc.exe, CtrlSM.sys
+    netsnitch.ps1, HTTPDebuggerSvc.exe, CtrlSM.sys
 
   What it does:
     1. Copies CtrlSM.sys next to the service as drv2\x64\netfilter2.sys and
@@ -393,12 +393,14 @@ public static class HttpIpc
 # ---------------------------------------------------------------------------
 if ($Uninstall) {
   Step "Uninstalling $SvcName"
-  try { Unregister-ScheduledTask -TaskName 'HttpCapture' -Confirm:$false -ErrorAction Stop; Ok 'removed persistence task' } catch {}
+  foreach ($tn in 'NetSnitch','HttpCapture') {   # HttpCapture = legacy task name
+    try { Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction Stop; Ok "removed persistence task '$tn'" } catch {}
+  }
   # Kill any running background/persistence capture so nothing stays armed.
   $killed = 0
   try {
     Get-CimInstance Win32_Process -Filter 'Name="powershell.exe"' |
-      Where-Object { $_.CommandLine -match 'HttpCapture' -and $_.ProcessId -ne $PID } |
+      Where-Object { ($_.CommandLine -match 'NetSnitch' -or $_.CommandLine -match 'HttpCapture') -and $_.ProcessId -ne $PID } |
       ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; $killed++ } catch {} }
   } catch {}
   if ($killed) { Ok "stopped $killed running capture process(es)" }
@@ -436,13 +438,13 @@ function New-PersistenceTask {
     # which breaks external traffic. The arm-once-per-boot guard also protects us.
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                    -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
-    Register-ScheduledTask -TaskName 'HttpCapture' -Action $action -Trigger $trigger `
+    Register-ScheduledTask -TaskName 'NetSnitch' -Action $action -Trigger $trigger `
       -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-    Ok "persistence task 'HttpCapture' created (starts ~90s after each boot, as SYSTEM)"
+    Ok "persistence task 'NetSnitch' created (starts ~90s after each boot, as SYSTEM)"
   } catch {
     $tr = "`"$pwsh`" $argline"
-    & (Join-Path $env:SystemRoot 'System32\schtasks.exe') /Create /TN 'HttpCapture' /TR $tr /SC ONSTART /DELAY 0001:30 /RU SYSTEM /RL HIGHEST /F | Out-Null
-    if ($LASTEXITCODE -eq 0) { Ok "persistence task 'HttpCapture' created (schtasks)" }
+    & (Join-Path $env:SystemRoot 'System32\schtasks.exe') /Create /TN 'NetSnitch' /TR $tr /SC ONSTART /DELAY 0001:30 /RU SYSTEM /RL HIGHEST /F | Out-Null
+    if ($LASTEXITCODE -eq 0) { Ok "persistence task 'NetSnitch' created (schtasks)" }
     else { Warn "could not create persistence task: $($_.Exception.Message)" }
   }
 }
@@ -487,7 +489,7 @@ if ($Background) {
     Start-Process -FilePath $pwsh -ArgumentList $a -WindowStyle Hidden | Out-Null
     Ok 'capture is running in the background (continuous).'
   }
-  Write-Host '    stop it with:  Get-CimInstance Win32_Process -Filter "Name=''powershell.exe''" | ? CommandLine -match HttpCapture | % { Stop-Process -Id $_.ProcessId }' -ForegroundColor DarkGray
+  Write-Host '    stop it with:  Get-CimInstance Win32_Process -Filter "Name=''powershell.exe''" | ? CommandLine -match NetSnitch | % { Stop-Process -Id $_.ProcessId }' -ForegroundColor DarkGray
   if ($Persistence) { Write-Host '    it will also start automatically at every boot.' -ForegroundColor DarkGray }
   return
 }
@@ -781,8 +783,8 @@ function Get-AgentId {
 # the capture - a feedback loop. We tag every upload three ways (destination host,
 # a request header, and a body sentinel) and drop any captured transaction that
 # matches, so our uploads are never re-sent or shown.
-$script:UploadMark = 'X-HttpCapture-Upload'
-$script:UploadSentinel = '__hc_upload__'
+$script:UploadMark = 'X-NetSnitch-Upload'
+$script:UploadSentinel = '__netsnitch_upload__'
 
 function Is-ServerTxn($c) {
   if ($script:ServerHost) {

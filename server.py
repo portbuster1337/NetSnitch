@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-HttpCapture collector server.
+NetSnitch collector server.
 
-Receives captured HTTP/HTTPS transactions (JSON) from one or more HttpCapture.ps1
+Receives captured HTTP/HTTPS transactions (JSON) from one or more netsnitch.ps1
 agents and serves a password-protected web UI to analyze them, grouped per agent.
 
-  - Each agent (a machine running HttpCapture.ps1 -Server <this>) gets an id.
+  - Each agent (a machine running netsnitch.ps1 -Server <this>) gets an id.
   - The home page lists all agents; click an agent to see everything it captured.
   - Every entry shows the site's favicon, method, URL, status, process and time,
     and expands to the full request headers / body and response headers / body.
@@ -17,7 +17,7 @@ No third-party dependencies - standard library only.
 
   python3 server.py --port 8771
   # then on the Windows machine:
-  .\\HttpCapture.ps1 -Server http://<this-host>:8771
+  .\\netsnitch.ps1 -Server http://<this-host>:8771
 """
 import argparse
 import hmac
@@ -161,7 +161,7 @@ _HREF_RE = re.compile(r'href=["\']([^"\']+)["\']', re.I)
 
 
 def _get(url, timeout=6):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (HttpCapture)"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (NetSnitch)"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read(262144), (r.headers.get("Content-Type") or "")   # cap 256 KB
 
@@ -293,9 +293,9 @@ color:#06101f;font-weight:700;padding:11px;cursor:pointer;font-size:14px}
 
 LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HttpCapture - sign in</title><style>__CSS__</style></head><body>
+<title>NetSnitch - sign in</title><style>__CSS__</style></head><body>
 <form class="login" method="post" action="/login">
-<h1><span class="dot"></span> HttpCapture</h1>
+<h1><span class="dot"></span> NetSnitch</h1>
 <p>Enter the one-time password shown in the server console.</p>
 <input type="password" name="password" placeholder="password" autofocus autocomplete="off">
 <button type="submit">Sign in</button>
@@ -304,14 +304,14 @@ LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8">
 
 INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HttpCapture</title><style>__CSS__</style></head><body>
-<header><span class="dot"></span><h1>HttpCapture</h1>
+<title>NetSnitch</title><style>__CSS__</style></head><body>
+<header><span class="dot"></span><h1>NetSnitch</h1>
 <span class="sub">collected agents &middot; click one to view its captures</span>
 <span class="right"><a href="/logout">sign out</a></span></header>
 <div class="wrap"><div id="agents" class="grid"></div>
 <div id="empty" class="empty" style="display:none">
 No agents yet. Run on a machine:<br><br>
-<code>.\\HttpCapture.ps1 -Server http://THIS-HOST:PORT</code></div></div>
+<code>.\\netsnitch.ps1 -Server http://THIS-HOST:PORT</code></div></div>
 <script>
 function ago(ms){var s=(Date.now()-ms)/1000;if(s<60)return Math.floor(s)+'s ago';
 if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';
@@ -335,7 +335,7 @@ load();setInterval(load,3000);
 
 AGENT_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HttpCapture - agent</title><style>__CSS__</style></head><body>
+<title>NetSnitch - agent</title><style>__CSS__</style></head><body>
 <header><a href="/">&larr;</a><h1 id="aname">agent</h1>
 <span class="sub" id="ameta"></span>
 <span class="right"><a href="/logout">sign out</a></span></header>
@@ -536,7 +536,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global PASSWORD
-    ap = argparse.ArgumentParser(description="HttpCapture collector server")
+    ap = argparse.ArgumentParser(description="NetSnitch collector server")
     ap.add_argument("--host", default="0.0.0.0", help="bind address (default 0.0.0.0)")
     ap.add_argument("--port", type=int, default=8771, help="port (default 8771)")
     ap.add_argument("--data", default=os.path.join(
@@ -552,11 +552,11 @@ def main():
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     bar = "=" * 60
     print(bar)
-    print("  HttpCapture server")
+    print("  NetSnitch server")
     print("  Web UI   : http://%s:%d/" % (args.host, args.port))
     print("  Database : %s" % args.data)
     print("  LOGIN PASSWORD (one-time, this run): %s" % PASSWORD)
-    print("  Agents push with:  .\\HttpCapture.ps1 -Server http://<this-host>:%d" % args.port)
+    print("  Agents push with:  .\\netsnitch.ps1 -Server http://<this-host>:%d" % args.port)
     print(bar)
     try:
         srv.serve_forever()
