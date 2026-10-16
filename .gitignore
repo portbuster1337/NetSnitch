@@ -1,2 +1,5 @@
 cap.out
 *.log
+captures.db
+captures.db-shm
+captures.db-wal
