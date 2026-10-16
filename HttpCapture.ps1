@@ -266,6 +266,44 @@ public static class HttpIpc
         }
         return o.ToArray();
     }
+
+    // A body record (tag 1 request body / tag 3 response body) holds one
+    // length-prefixed blob that runs to the end of the record (D+16). Pull the
+    // RAW bytes - no printable check - so compressed/binary bodies survive.
+    public static byte[] ExtractBody(byte[] b, int D) {
+        int end = D + 16;
+        if (end > b.Length) end = b.Length;
+        for (int p = 16; p + 4 <= end; p++) {
+            long L = (long)(uint)(b[p] | (b[p+1] << 8) | (b[p+2] << 16) | (b[p+3] << 24));
+            if (L >= 1 && (long)p + 4 + L == end) {
+                byte[] body = new byte[L];
+                Array.Copy(b, p + 4, body, 0, (int)L);
+                return body;
+            }
+        }
+        return null;
+    }
+
+    // Decode a body to text, transparently inflating gzip (magic 1f 8b) and
+    // zlib/deflate (magic 78 xx) - which is how servers compress responses.
+    public static string DecodeBody(byte[] body) {
+        if (body == null || body.Length == 0) return "";
+        try {
+            if (body.Length > 2 && body[0] == 0x1f && body[1] == 0x8b) {
+                using (var ms = new System.IO.MemoryStream(body))
+                using (var gz = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionMode.Decompress))
+                using (var sr = new System.IO.StreamReader(gz, Encoding.UTF8))
+                    return sr.ReadToEnd();
+            }
+            if (body.Length > 2 && body[0] == 0x78 && (body[1] == 0x01 || body[1] == 0x9c || body[1] == 0xda)) {
+                using (var ms = new System.IO.MemoryStream(body, 2, body.Length - 2))  // skip 2-byte zlib header
+                using (var df = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionMode.Decompress))
+                using (var sr = new System.IO.StreamReader(df, Encoding.UTF8))
+                    return sr.ReadToEnd();
+            }
+        } catch { }
+        return Encoding.UTF8.GetString(body);   // plain text, or decompress failed
+    }
 }
 '@
 
@@ -377,7 +415,8 @@ if ($SelfTest) {
   Start-Job {
     Start-Sleep 2
     foreach ($n in 1..4) {
-      foreach ($u in 'http://neverssl.com','https://example.com','https://httpbin.org/get') {
+      foreach ($u in 'http://neverssl.com','https://example.com','https://httpbin.org/get',
+                     'https://httpbin.org/gzip','https://httpbin.org/deflate') {
         try { Invoke-WebRequest $u -UseBasicParsing -TimeoutSec 12 | Out-Null } catch {}
       }
       try { Invoke-WebRequest 'https://httpbin.org/post' -Method POST -Body "self_test_body_$n" -ContentType 'text/plain' -UseBasicParsing -TimeoutSec 12 | Out-Null } catch {}
@@ -475,6 +514,21 @@ function Ingest([string[]]$fields, [uint32]$id, [int]$tag) {
   }
 }
 
+# A dedicated body record (tag 1 = request body, tag 3 = response body). The text
+# is already decoded (and decompressed) by DecodeBody.
+function Ingest-Body([uint32]$id, [int]$tag, [string]$text) {
+  if (-not $text -or $text.Trim().Length -eq 0) { return }
+  $key = [string]$id
+  if ($script:txns.Contains($key)) { $t = $script:txns[$key] }
+  else {
+    $script:txn++
+    $t = @{ Num = $script:txn; Proc=''; User=''; Host=''; Url=''; Method='';
+            ReqHeaders=''; ReqBody=''; ResHeaders=''; ResBody=''; Status=''; SawResp=$false }
+    $script:txns[$key] = $t
+  }
+  if ($tag -eq 1) { $t.ReqBody += $text } else { $t.ResBody += $text; $t.SawResp = $true }
+}
+
 # ---------------------------------------------------------------------------
 # Follow the publisher cursor and decode every new record.
 # ---------------------------------------------------------------------------
@@ -513,8 +567,14 @@ try {
       $raw = [HttpIpc]::ReadBytes($ring.Data, $off, $readLen)
       $id  = [uint32]([System.Runtime.InteropServices.Marshal]::ReadInt32($ring.Data, $off + 0x14))  # transaction id
       $tag = [System.Runtime.InteropServices.Marshal]::ReadInt32($ring.Data, $off + 0x10)             # 0=req 1=reqbody 2=resp 3=respbody
-      $segs = [HttpIpc]::Fields($raw, $raw.Length)
-      if ($segs.Count) { Ingest $segs $id $tag }
+      if ($tag -eq 1 -or $tag -eq 3) {
+        # Body record: pull raw bytes (binary-safe) and decode/decompress.
+        $bb = [HttpIpc]::ExtractBody($raw, $d)
+        if ($bb) { Ingest-Body $id $tag ([HttpIpc]::DecodeBody($bb)) }
+      } else {
+        $segs = [HttpIpc]::Fields($raw, $raw.Length)
+        if ($segs.Count) { Ingest $segs $id $tag }
+      }
     }
     # Safety valve for sustained traffic with no lull, so memory stays bounded.
     if ($script:txns.Count -ge 200) { Flush-All }
