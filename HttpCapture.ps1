@@ -429,21 +429,15 @@ function Print-Txn($c) {
   if ($c.ResBody.Length)  { Emit-Body '< RESPONSE BODY' $c.ResBody ([ConsoleColor]::Green) }
 }
 
-# Print and remove transactions that already have a response (complete). Called
-# after a short lull so each exchange appears promptly without being orphaned.
-function Flush-Ready {
-  foreach ($key in @($script:txns.Keys)) {
-    if ($script:txns[$key].ResHeaders -or $script:txns[$key].ResBody) {
-      Print-Txn $script:txns[$key]; $script:txns.Remove($key)
-    }
-  }
-}
+# The service writes a transaction's records (request, response headers, body) as
+# one tight burst, so once the ring goes quiet for a moment every transaction in
+# hand is complete. Flush them all then.
 function Flush-All {
   foreach ($key in @($script:txns.Keys)) { Print-Txn $script:txns[$key] }
   $script:txns.Clear()
 }
 
-function Ingest([string[]]$fields, [uint32]$id) {
+function Ingest([string[]]$fields, [uint32]$id, [int]$tag) {
   $key = [string]$id
   if ($script:txns.Contains($key)) { $t = $script:txns[$key] }
   else {
@@ -452,6 +446,10 @@ function Ingest([string[]]$fields, [uint32]$id) {
             ReqHeaders=''; ReqBody=''; ResHeaders=''; ResBody=''; Status=''; SawResp=$false }
     $script:txns[$key] = $t
   }
+  # The record tag says which half a loose body belongs to: 1 = request body,
+  # 3 = response body. Far more reliable than guessing from order.
+  if ($tag -ge 2) { $t.SawResp = $true }
+  $toRes = ($tag -eq 3) -or ($tag -ne 1 -and $t.SawResp)
   foreach ($f in $fields) {
     $trim = $f.Trim()
     if ($f -match '^[A-Z][A-Z]+ \S+ HTTP/\d') {
@@ -473,7 +471,7 @@ function Ingest([string[]]$fields, [uint32]$id) {
     if ($trim -eq $env:USERNAME)                    { if (-not $t.User) { $t.User = $trim }; continue }
     if ($trim -match '^\d{1,4}$')                   { continue }    # bare status-code field
     if ($trim -match '^[\w.\-]{1,24}$' -and -not $t.User) { $t.User = $trim; continue }
-    if ($t.SawResp) { $t.ResBody += $f } else { $t.ReqBody += $f }  # body chunk
+    if ($toRes) { $t.ResBody += $f } else { $t.ReqBody += $f }      # body chunk, routed by tag
   }
 }
 
@@ -494,10 +492,7 @@ try {
       # Nothing new: flush completed exchanges after a short lull; flush whatever
       # is left (e.g. a request whose response we never saw) after a longer one.
       $idle += 120
-      if ($script:txns.Count) {
-        if ($idle -ge 360)  { Flush-Ready }
-        if ($idle -ge 1400) { Flush-All }
-      }
+      if ($idle -ge 400 -and $script:txns.Count) { Flush-All }
       Start-Sleep -Milliseconds 120
       continue
     }
@@ -509,15 +504,20 @@ try {
       if ($st -ne 2 -and $st -ne 3) { continue }     # 2=ready, 3=already consumed (data persists)
       $off = 0; $len = 0
       if (-not [HttpIpc]::SlotRange($ring, $slot, [ref]$off, [ref]$len)) { continue }
+      # The chunk's D field is the payload size and EXCLUDES the 16-byte header,
+      # so the record actually runs to D+16 - and a body field's last bytes live
+      # in that tail. Read a little past D (slack) so bodies are never clipped.
       $d = [HttpIpc]::RecordLen($ring, $off)
       if ($d -lt 16 -or $d -gt $len) { $d = [Math]::Min($len, 0x6000) }
-      $raw = [HttpIpc]::ReadBytes($ring.Data, $off, $d)
-      $id = [uint32]([System.Runtime.InteropServices.Marshal]::ReadInt32($ring.Data, $off + 0x14))  # transaction id
+      $readLen = [Math]::Min($len, $d + 48)
+      $raw = [HttpIpc]::ReadBytes($ring.Data, $off, $readLen)
+      $id  = [uint32]([System.Runtime.InteropServices.Marshal]::ReadInt32($ring.Data, $off + 0x14))  # transaction id
+      $tag = [System.Runtime.InteropServices.Marshal]::ReadInt32($ring.Data, $off + 0x10)             # 0=req 1=reqbody 2=resp 3=respbody
       $segs = [HttpIpc]::Fields($raw, $raw.Length)
-      if ($segs.Count) { Ingest $segs $id }
+      if ($segs.Count) { Ingest $segs $id $tag }
     }
-    # Flush transactions once the backlog grows, so long sessions stay bounded.
-    if ($script:txns.Count -ge 40) { Flush-All }
+    # Safety valve for sustained traffic with no lull, so memory stays bounded.
+    if ($script:txns.Count -ge 200) { Flush-All }
     $last = $h.WriteCursor
   }
 } finally {
