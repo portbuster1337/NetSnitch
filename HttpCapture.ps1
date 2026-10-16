@@ -40,7 +40,9 @@ param(
   [string]$Server = '',     # collector URL, e.g. http://host:8771 - stream captures there as JSON
   [switch]$NoInstall,
   [switch]$Uninstall,
-  [switch]$SelfTest         # generate a few HTTP/HTTPS requests so there is traffic to show
+  [switch]$SelfTest,        # generate a few HTTP/HTTPS requests so there is traffic to show
+  [switch]$Background,      # detach and run continuously in a hidden process, then return
+  [switch]$Persistence      # install a scheduled task that starts capture at every boot
 )
 
 $ErrorActionPreference = 'Continue'
@@ -80,8 +82,13 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
   Write-Host 'Administrator rights required - relaunching elevated...' -ForegroundColor Yellow
   $a = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
   if ($PSBoundParameters.ContainsKey('Seconds'))  { $a += @('-Seconds',"$Seconds") }
+  if ($PSBoundParameters.ContainsKey('TrimBody')) { $a += @('-TrimBody',"$TrimBody") }
+  if ($Server)     { $a += @('-Server',$Server) }
   if ($NoInstall)  { $a += '-NoInstall' }
   if ($Uninstall)  { $a += '-Uninstall' }
+  if ($SelfTest)   { $a += '-SelfTest' }
+  if ($Background) { $a += '-Background' }
+  if ($Persistence){ $a += '-Persistence' }
   Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $a
   return
 }
@@ -93,6 +100,8 @@ Add-Type -TypeDefinition @'
 using System;
 using System.Text;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Threading;
 using System.Runtime.InteropServices;
 
 public static class HttpIpc
@@ -306,19 +315,44 @@ public static class HttpIpc
         return Encoding.UTF8.GetString(body);   // plain text, or decompress failed
     }
 
-    // ---- snapshot scanner --------------------------------------------------
-    // Request records are written then CLEARED by the service within a sub-ms
-    // window, so a forward "read each slot once" reader loses the race and misses
-    // most requests (leaving response-only orphans). Instead we re-scan EVERY
-    // slot continuously via cheap bounded reads and emit a slot's record whenever
-    // its content changes - which reliably catches the transient request records
-    // (proven: 20/20 requests + 20/20 responses). Grouping is by the transaction
-    // id at +0x14, which correlates the request and response halves.
+    // ---- background capture pump -------------------------------------------
+    // Request records are written then CLEARED by the service soon after it pairs
+    // them with the response, so a forward "read each slot once" reader loses the
+    // race and misses most requests (leaving response-only orphans). Instead a
+    // native background thread re-scans EVERY slot continuously and queues a slot's
+    // record whenever its content changes - which reliably catches the transient
+    // request records. Grouping is by the transaction id at +0x14, which correlates
+    // the request and response halves.
+    //
+    // The thread sleeps 1ms between passes (with 1ms timer resolution): that is
+    // frequent enough to catch every request (they live tens of ms, through the
+    // network round-trip) yet uses ~0.2% of one core instead of pinning it at 100%
+    // like a no-sleep loop would. PowerShell just drains the queue periodically.
+    [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint p);
+    [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint p);
     static uint[] _slotSig;
+    static volatile bool _pumpRun;
+    static Thread _pumpThread;
+    static ConcurrentQueue<byte[]> _pumpQ = new ConcurrentQueue<byte[]>();
     static uint RU(IntPtr p, long o) { return (uint)Marshal.ReadInt32(p, (int)o); }
-    public static byte[][] Scan(IntPtr data, int cap, int stride, long dataBytes) {
-        if (_slotSig == null || _slotSig.Length != cap) _slotSig = new uint[cap];
-        var o = new List<byte[]>();
+
+    public static void StartPump(IntPtr data, int cap, int stride, long dataBytes, int sleepMs) {
+        _slotSig = new uint[cap];
+        _pumpRun = true;
+        PumpScan(data, cap, stride, dataBytes, true);   // prime: skip the pre-attach backlog
+        _pumpThread = new Thread(delegate() {
+            // Run the scan thread below normal priority so it can never starve the
+            // OS/ssh/services even under a heavy traffic storm.
+            try { Thread.CurrentThread.Priority = ThreadPriority.BelowNormal; } catch { }
+            timeBeginPeriod(1);
+            try { while (_pumpRun) { PumpScan(data, cap, stride, dataBytes, false); if (sleepMs > 0) Thread.Sleep(sleepMs); } }
+            finally { timeEndPeriod(1); }
+        });
+        _pumpThread.IsBackground = true;
+        _pumpThread.Start();
+    }
+
+    static void PumpScan(IntPtr data, int cap, int stride, long dataBytes, bool primeOnly) {
         for (int slot = 0; slot < cap; slot++) {
             long off = (long)slot * stride;
             if (off + 24 > dataBytes) break;
@@ -331,26 +365,130 @@ public static class HttpIpc
             if (sig == 0) sig = 1;
             if (_slotSig[slot] == sig) continue;                           // unchanged since last scan
             _slotSig[slot] = sig;
+            if (primeOnly) continue;
             int n = (int)Math.Min((long)D + 48, Math.Min((long)stride, dataBytes - off));
             if (n < 16) continue;
             byte[] rec = new byte[n];
             Marshal.Copy(new IntPtr(data.ToInt64() + off), rec, 0, n);
-            o.Add(rec);
+            _pumpQ.Enqueue(rec);
         }
+    }
+
+    public static byte[][] Drain() {
+        var o = new List<byte[]>();
+        byte[] r;
+        while (_pumpQ.TryDequeue(out r)) o.Add(r);
         return o.ToArray();
+    }
+
+    public static void StopPump() {
+        _pumpRun = false;
+        try { if (_pumpThread != null) _pumpThread.Join(500); } catch { }
     }
 }
 '@
 
 # ---------------------------------------------------------------------------
-# Uninstall
+# Uninstall (also removes the persistence task)
 # ---------------------------------------------------------------------------
 if ($Uninstall) {
   Step "Uninstalling $SvcName"
+  try { Unregister-ScheduledTask -TaskName 'HttpCapture' -Confirm:$false -ErrorAction Stop; Ok 'removed persistence task' } catch {}
+  # Kill any running background/persistence capture so nothing stays armed.
+  $killed = 0
+  try {
+    Get-CimInstance Win32_Process -Filter 'Name="powershell.exe"' |
+      Where-Object { $_.CommandLine -match 'HttpCapture' -and $_.ProcessId -ne $PID } |
+      ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; $killed++ } catch {} }
+  } catch {}
+  if ($killed) { Ok "stopped $killed running capture process(es)" }
+  try { Remove-Item (Join-Path $storeDir 'armed.boot') -Force -ErrorAction SilentlyContinue } catch {}
+  # Stopping the service clears the driver's 80/443 filters and restores traffic.
   Sc @('stop', $SvcName) | Out-Null
   Start-Sleep 2
   $r = Sc @('delete', $SvcName)
   if ($r -eq 0) { Ok "service removed" } else { Warn "sc delete returned $r" }
+  return
+}
+
+# ---------------------------------------------------------------------------
+# -Persistence: a scheduled task that starts continuous capture at every boot
+# (hidden, as SYSTEM). It uses -NoInstall because the service is installed once
+# and auto-starts; the CA and rules persist across reboots.
+# -Background: relaunch this script hidden + detached, running forever, and
+# return immediately so the caller gets their prompt back.
+# ---------------------------------------------------------------------------
+$pwsh = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+function New-PersistenceTask {
+  $argline = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -NoInstall -Seconds 0"
+  if ($Server)         { $argline += " -Server `"$Server`"" }
+  if ($TrimBody -gt 0) { $argline += " -TrimBody $TrimBody" }
+  try {
+    $action    = New-ScheduledTaskAction -Execute $pwsh -Argument $argline
+    # Start 90s AFTER boot, not AtStartup: the service and networking need to be
+    # fully up, and starting during the early-boot traffic storm is what spiked
+    # the CPU. The delayed start lets the machine settle first.
+    $trigger   = New-ScheduledTaskTrigger -AtStartup
+    $trigger.Delay = 'PT90S'
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    # No RestartCount: an auto-restart would RE-arm the already-armed service,
+    # which breaks external traffic. The arm-once-per-boot guard also protects us.
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                   -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName 'HttpCapture' -Action $action -Trigger $trigger `
+      -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+    Ok "persistence task 'HttpCapture' created (starts ~90s after each boot, as SYSTEM)"
+  } catch {
+    $tr = "`"$pwsh`" $argline"
+    & (Join-Path $env:SystemRoot 'System32\schtasks.exe') /Create /TN 'HttpCapture' /TR $tr /SC ONSTART /DELAY 0001:30 /RU SYSTEM /RL HIGHEST /F | Out-Null
+    if ($LASTEXITCODE -eq 0) { Ok "persistence task 'HttpCapture' created (schtasks)" }
+    else { Warn "could not create persistence task: $($_.Exception.Message)" }
+  }
+}
+
+if ($Persistence) {
+  Step 'Installing reboot persistence'
+  New-PersistenceTask
+  # IMPORTANT: -Persistence only INSTALLS the boot task. It must NOT fall through
+  # into the foreground capture loop - doing so would arm the service and capture
+  # in whatever session launched it, and if that session ends the armed capture is
+  # orphaned (breaks external traffic / spikes CPU). To also start capturing now,
+  # combine with -Background (handled below). Otherwise we are done.
+  if (-not $Background) {
+    Write-Host '    capture will start automatically ~90s after each boot.' -ForegroundColor DarkGray
+    Write-Host '    to also start it now without rebooting, add -Background.' -ForegroundColor DarkGray
+    return
+  }
+}
+
+if ($Background) {
+  Step 'Launching continuous capture in the background'
+  # Build the hidden, run-forever command line for the detached child.
+  $cl = "`"$pwsh`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Seconds 0"
+  if ($NoInstall)      { $cl += ' -NoInstall' }
+  if ($Server)         { $cl += " -Server `"$Server`"" }
+  if ($TrimBody -gt 0) { $cl += " -TrimBody $TrimBody" }
+  # Spawn via WMI Win32_Process.Create, NOT Start-Process: a WMI-created process
+  # is parented to WmiPrvSE and lives outside the launcher's job object/session,
+  # so it survives the parent exiting (and survives the launching console/SSH
+  # session closing - Start-Process children get killed with that job object).
+  $launched = $false
+  try {
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cl } -ErrorAction Stop
+    if ($r.ReturnValue -eq 0) { $launched = $true; Ok "capture is running in the background (continuous, pid $($r.ProcessId))." }
+    else { Warn "Win32_Process.Create returned $($r.ReturnValue); falling back to Start-Process" }
+  } catch { Warn "WMI spawn failed ($($_.Exception.Message)); falling back to Start-Process" }
+  if (-not $launched) {
+    $a = @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',"`"$PSCommandPath`"",'-Seconds','0')
+    if ($NoInstall)      { $a += '-NoInstall' }
+    if ($Server)         { $a += @('-Server',$Server) }
+    if ($TrimBody -gt 0) { $a += @('-TrimBody',"$TrimBody") }
+    Start-Process -FilePath $pwsh -ArgumentList $a -WindowStyle Hidden | Out-Null
+    Ok 'capture is running in the background (continuous).'
+  }
+  Write-Host '    stop it with:  Get-CimInstance Win32_Process -Filter "Name=''powershell.exe''" | ? CommandLine -match HttpCapture | % { Stop-Process -Id $_.ProcessId }' -ForegroundColor DarkGray
+  if ($Persistence) { Write-Host '    it will also start automatically at every boot.' -ForegroundColor DarkGray }
   return
 }
 
@@ -436,10 +574,30 @@ catch { $cn = $false; $mutex = New-Object System.Threading.Mutex($false, $mutexN
 $owned = $false
 try { $owned = $mutex.WaitOne(3000) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
 if ($owned) { Ok "acquired $mutexName (posing as the UI)" }
-else { Warn "could not acquire $mutexName - the real UI may be open; close it and re-run" }
+else { Warn "could not acquire $mutexName - another capture instance or the UI already armed this service" }
 
-$arm = [HttpIpc]::ArmCapture($env:USERNAME)
-Ok "arm commands -> $arm"
+# Arm-once-per-boot guard. Arming is only safe ONCE per boot: re-arming an
+# already-armed service breaks external traffic (and can spin the service CPU).
+# We record the current boot timestamp in a sentinel file after arming; if a
+# later run this same boot finds a matching sentinel, it skips arming and just
+# attaches read-only. The service stays armed across the whole boot regardless.
+$bootId = ''
+try { $bootId = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString('o') } catch {}
+$armSentinel = Join-Path $storeDir 'armed.boot'
+$alreadyArmed = $false
+try { if ($bootId -and (Test-Path $armSentinel) -and ((Get-Content $armSentinel -Raw).Trim() -eq $bootId)) { $alreadyArmed = $true } } catch {}
+
+# Only push the arm commands if we own the mutex AND the service was not already
+# armed this boot. Otherwise attach read-only to the already-armed service.
+if ($owned -and -not $alreadyArmed) {
+  $arm = [HttpIpc]::ArmCapture($env:USERNAME)
+  Ok "arm commands -> $arm"
+  try { if ($bootId) { if (-not (Test-Path $storeDir)) { New-Item -ItemType Directory -Path $storeDir -Force | Out-Null }; Set-Content -Path $armSentinel -Value $bootId -Encoding Ascii } } catch {}
+} elseif ($alreadyArmed) {
+  Warn 'service already armed this boot - NOT re-arming (would break external traffic); attaching read-only'
+} else {
+  Warn 'NOT re-arming (would break external traffic) - attaching read-only to the already-armed service'
+}
 
 $ring = [HttpIpc]::Attach('Global\HttpDebuggerIpcHttpTransaction', 8000)
 if (-not $ring) { Fail 'could not attach to the HttpTransaction ring (is the service running?)'; if ($owned) { $mutex.ReleaseMutex() }; return }
@@ -691,13 +849,23 @@ $stride = [int]$ring.H.Stride
 $dbytes = [long]$ring.DataBytes
 $stop   = if ($Seconds -gt 0) { [DateTime]::UtcNow.AddSeconds($Seconds) } else { [DateTime]::MaxValue }
 $flushAt = [DateTime]::UtcNow.AddMilliseconds(200)
-[void][HttpIpc]::Scan($ring.Data, $cap, $stride, $dbytes)   # prime signatures: skip pre-attach backlog
+
+# For continuous (background/persistence) runs, drop this process - and the HTTP
+# service while it is armed - below normal priority. This is a hard safety net:
+# even if traffic spikes the capture work, it can never starve the OS, sshd, or
+# other services, so the machine stays responsive and reachable. (Bounded
+# -Seconds runs stay at normal priority.)
+if ($Seconds -le 0) {
+  try { [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
+  try { Get-Process -Name 'HTTPDebuggerSvc' -ErrorAction SilentlyContinue | ForEach-Object { $_.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } } catch {}
+}
+# A native background thread re-scans the ring every 1ms and queues changed
+# records; we just drain the queue here. That catches every transient request
+# record while using ~0.2% of one core (a no-sleep loop pins a whole core).
+[HttpIpc]::StartPump($ring.Data, $cap, $stride, $dbytes, 1)
 try {
   while ([DateTime]::UtcNow -lt $stop) {
-    # Continuously re-scan the whole ring; Scan returns a slot's record only when
-    # its content changes, which catches the sub-ms request records before the
-    # service clears them. No sleep in the hot path - speed is what wins the race.
-    $recs = [HttpIpc]::Scan($ring.Data, $cap, $stride, $dbytes)
+    $recs = [HttpIpc]::Drain()
     foreach ($raw in $recs) {
       if ($raw.Length -lt 24) { continue }
       $d   = [System.BitConverter]::ToInt32($raw, 12)
@@ -715,8 +883,10 @@ try {
       Flush-Settled $false                                         # emit settled complete pairs
       $flushAt = [DateTime]::UtcNow.AddMilliseconds(200)
     }
+    Start-Sleep -Milliseconds 150                                  # drain cadence; the pump thread does the fast work
   }
 } finally {
+  [HttpIpc]::StopPump()
   Flush-Settled $true
   if ($owned) { try { $mutex.ReleaseMutex() } catch {} }
   Write-Host ''

@@ -41,7 +41,17 @@ Run from an elevated prompt (or let it elevate itself):
 # Trim long bodies to N characters (default 0 = show the whole body)
 .\HttpCapture.ps1 -TrimBody 2000
 
-# Remove the service
+# Run continuously in a hidden background process (returns immediately)
+.\HttpCapture.ps1 -Background -Server http://<collector-host>:8771
+
+# Start automatically ~90s after every boot (installs a SYSTEM scheduled task)
+.\HttpCapture.ps1 -Persistence -Server http://<collector-host>:8771
+
+# Install the boot task AND start capturing now, in the background
+.\HttpCapture.ps1 -Persistence -Background -Server http://<collector-host>:8771
+
+# Stop everything cleanly (kills background capture, removes the task,
+# stops the service so the driver filters are released and traffic is normal)
 .\HttpCapture.ps1 -Uninstall
 ```
 
@@ -49,12 +59,32 @@ Run from an elevated prompt (or let it elevate itself):
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
-| `-Seconds`   | `0` | Read duration; `0` = until Ctrl+C |
-| `-TrimBody`  | `0` | Trim each body to N chars; `0` = whole body |
-| `-Server`    | `''`| Stream captures as JSON to a collector (e.g. `http://host:8771`) |
-| `-NoInstall` | off | Skip install/start, just arm + read |
-| `-SelfTest`  | off | Emit sample HTTP/HTTPS requests in the background |
-| `-Uninstall` | off | Stop and delete the service, then exit |
+| `-Seconds`     | `0` | Read duration; `0` = until Ctrl+C |
+| `-TrimBody`    | `0` | Trim each body to N chars; `0` = whole body |
+| `-Server`      | `''`| Stream captures as JSON to a collector (e.g. `http://host:8771`) |
+| `-NoInstall`   | off | Skip install/start, just arm + read |
+| `-SelfTest`    | off | Emit sample HTTP/HTTPS requests in the background |
+| `-Background`  | off | Detach and capture continuously in a hidden process, then return. Survives the launching console/SSH session closing. |
+| `-Persistence` | off | Install a SYSTEM scheduled task that starts capture ~90s after every boot. Only installs the task (combine with `-Background` to also start now). |
+| `-Uninstall`   | off | Stop the background capture + task, stop and delete the service, then exit |
+
+### Running continuously (background / persistence)
+
+`-Background` and `-Persistence` are built to be safe to leave running:
+
+- **Runs at below-normal priority** (the process, the scan thread, and the HTTP
+  service while armed) so capture can never starve the OS, SSH, or other
+  services - the machine stays responsive even under a heavy traffic storm.
+- **Arms the capture exactly once per boot.** Re-arming an already-armed service
+  breaks external traffic, so any second run this boot (or the boot task itself)
+  attaches read-only instead of re-arming.
+- **The boot task starts ~90s after boot**, after the service and networking have
+  settled, to avoid colliding with the early-boot traffic storm.
+
+To stop a continuous capture, use `-Uninstall` (clean - releases the driver
+filters), or kill the process and `sc stop HTTPDebuggerPro`. Simply killing the
+capture process while it is armed leaves the driver's 80/443 filters in place
+until the service is stopped or the machine reboots.
 
 ## Central collector (optional)
 
