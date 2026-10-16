@@ -97,6 +97,11 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
   return
 }
 
+# Build marker - bump on every change so it is obvious which copy is running.
+$NetSnitchBuild = '2026.10.17.4'
+Write-Host ''
+Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
+
 # Normalize -Domains into a clean, lowercased list. Accepts both array form
 # (-Domains a,b) and a single comma-separated string (-Domains "a,b").
 $script:Domains = @($Domains | ForEach-Object { $_ -split ',' } |
