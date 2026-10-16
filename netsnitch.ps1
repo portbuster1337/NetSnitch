@@ -98,7 +98,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.17.7'
+$NetSnitchBuild = '2026.10.17.8'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -622,6 +622,22 @@ if ($owned -and -not $alreadyArmed) {
   Warn 'NOT re-arming (would break external traffic) - attaching read-only to the already-armed service'
 }
 
+# HTTPS decryption depends on the HTTP DEBUGGER root CA being in
+# LocalMachine\Root; selector 4 installs it, but the service processes the
+# command asynchronously. Verify it here so the log says plainly whether
+# https:// can be decrypted this boot.
+$caTries = 2
+if ($owned -and -not $alreadyArmed) { $caTries = 8 }
+$caNow = @()
+for ($i = 0; $i -lt $caTries; $i++) {
+  $caNow = @(Get-ChildItem Cert:\LocalMachine\Root -EA SilentlyContinue |
+             Where-Object { $_.Subject -like '*HTTP DEBUGGER*' } | Select-Object -First 1)
+  if ($caNow.Count) { break }
+  Start-Sleep -Milliseconds 500
+}
+if ($caNow.Count) { Ok "root CA trusted: $($caNow[0].Subject) - HTTPS decryption ready" }
+else { Warn 'root CA NOT in LocalMachine\Root after arming - https:// traffic will not be decrypted; reboot and run again, and report this line if it repeats' }
+
 $ring = [HttpIpc]::Attach('Global\HttpDebuggerIpcHttpTransaction', 8000)
 if (-not $ring) { Fail 'could not attach to the HttpTransaction ring (is the service running?)'; if ($owned) { $mutex.ReleaseMutex() }; return }
 Ok "attached to $($ring.DataName) (capacity $($ring.H.Capacity))"
@@ -893,6 +909,16 @@ function Send-Batch($list) {
     $first = ($script:UploadOk -eq 0)
     $script:UploadOk += $list.Count
     if ($first)            { Ok "server upload working (first batch sent, total: $script:UploadOk)" }
+    # One-time confirmation that https records are flowing end to end; after
+    # this the collector UI is the place to watch them.
+    if (-not $script:SentHttps) {
+      $h = $list | Where-Object { $_.Url -like 'https://*' } | Select-Object -First 1
+      if ($h) {
+        $script:SentHttps = $true
+        $u = [string]$h.Url; if ($u.Length -gt 110) { $u = $u.Substring(0, 110) + '...' }
+        Ok "https capture uploaded to collector (first: $u)"
+      }
+    }
     if ($script:UploadErr) { Ok "server upload recovered (total sent: $script:UploadOk)"; $script:UploadErr = $false }
   } catch {
     # Surface the first failure (and recoveries) instead of silently dropping.
