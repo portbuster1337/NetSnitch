@@ -98,9 +98,16 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.17.5'
+$NetSnitchBuild = '2026.10.17.6'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
+
+# Show exactly which switches arrived. Running a .ps1 from cmd.exe goes through
+# the Windows file association, which drops the extra arguments before the
+# script ever sees them; this line makes that obvious at a glance.
+$gotSwitches = @($PSBoundParameters.Keys | ForEach-Object { "-$_" })
+if ($gotSwitches.Count) { Write-Host "    switches: $($gotSwitches -join ' ')" -ForegroundColor DarkGray }
+else { Write-Host '    switches: none (started without arguments)' -ForegroundColor DarkGray }
 
 # Normalize -Domains into a clean, lowercased list. Accepts both array form
 # (-Domains a,b) and a single comma-separated string (-Domains "a,b").

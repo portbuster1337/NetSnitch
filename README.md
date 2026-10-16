@@ -23,7 +23,18 @@ HTTPS in the clear.
 
 ## Usage
 
-Run from an elevated prompt (or let it elevate itself):
+Run these from a PowerShell window (in cmd, type `powershell` first), from an
+elevated prompt, or let the script elevate itself.
+
+Typing `.\netsnitch.ps1 -Server ...` directly into cmd.exe does NOT work: cmd
+launches the script through the Windows file association, which drops the extra
+arguments, so every flag is silently ignored. From cmd, call powershell.exe
+explicitly:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\netsnitch.ps1 -Server http://<collector-host>:8771
+
+The script prints the switches it received under the build banner
+(`switches: -Server -Domains`), so a dropped flag is visible at a glance.
 
 ```powershell
 # Install the service + driver, arm capture, and stream transactions until Ctrl+C
