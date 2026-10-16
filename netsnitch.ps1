@@ -98,7 +98,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.17.6'
+$NetSnitchBuild = '2026.10.17.7'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -837,6 +837,34 @@ function Is-ServerTxn($c) {
   return $false
 }
 
+# Captured bodies can be binary (NTLM blobs, images, fonts). Their bytes get
+# translated to characters, so a string can contain control characters and lone
+# surrogates. PowerShell 5.1's ConvertTo-Json leaves some control characters
+# unescaped, which makes the collector reject the whole batch (400) and lose
+# every text record that rode along with the binary one. Strip C0 controls
+# except tab / newline / carriage return.
+function Clean-Text([string]$s) {
+  if (-not $s) { return $s }
+  return [regex]::Replace($s, '[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF]', '')
+}
+
+# One readable error string: message, server response body (if any), inner chain.
+function Expl-Err($e) {
+  $msg = $e.Message
+  try {
+    $resp = $e.Response
+    if ($resp) {
+      $sr = New-Object IO.StreamReader($resp.GetResponseStream())
+      $detail = $sr.ReadToEnd().Trim()
+      if ($detail.Length -gt 200) { $detail = $detail.Substring(0, 200) }
+      if ($detail) { $msg += ' | ' + $detail }
+    }
+  } catch {}
+  $inner = $e.InnerException
+  while ($inner) { $msg += ' | ' + $inner.Message; $inner = $inner.InnerException }
+  return $msg
+}
+
 # Send all transactions from one flush in a single POST (far less self-traffic
 # than one request each).
 function Send-Batch($list) {
@@ -845,10 +873,10 @@ function Send-Batch($list) {
   foreach ($c in $list) {
     $items += @{
       ts = [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
-      process = $c.Proc; user = $c.User; host = $c.Host; url = $c.Url
-      method = $c.Method; status = $c.Status
-      requestHeaders = $c.ReqHeaders; requestBody = $c.ReqBody
-      responseHeaders = $c.ResHeaders; responseBody = $c.ResBody
+      process = Clean-Text $c.Proc; user = Clean-Text $c.User; host = Clean-Text $c.Host; url = Clean-Text $c.Url
+      method = Clean-Text $c.Method; status = Clean-Text $c.Status
+      requestHeaders = Clean-Text $c.ReqHeaders; requestBody = Clean-Text $c.ReqBody
+      responseHeaders = Clean-Text $c.ResHeaders; responseBody = Clean-Text $c.ResBody
     }
   }
   $body = @{
@@ -857,8 +885,11 @@ function Send-Batch($list) {
     items = $items
   } | ConvertTo-Json -Depth 5 -Compress
   try {
-    Invoke-RestMethod -Method Post -Uri "$script:ServerBase/api/ingest" -Body $body `
-      -ContentType 'application/json' -Headers @{ $script:UploadMark = '1' } -TimeoutSec 10 | Out-Null
+    # Pre-encode to UTF-8: PowerShell 5.1 does not reliably encode string bodies
+    # as UTF-8, which would corrupt every non-ASCII byte of a binary capture.
+    $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+    Invoke-RestMethod -Method Post -Uri "$script:ServerBase/api/ingest" -Body $bytes `
+      -ContentType 'application/json; charset=utf-8' -Headers @{ $script:UploadMark = '1' } -TimeoutSec 10 | Out-Null
     $first = ($script:UploadOk -eq 0)
     $script:UploadOk += $list.Count
     if ($first)            { Ok "server upload working (first batch sent, total: $script:UploadOk)" }
@@ -866,10 +897,7 @@ function Send-Batch($list) {
   } catch {
     # Surface the first failure (and recoveries) instead of silently dropping.
     if (-not $script:UploadErr) {
-      $msg = $_.Exception.Message
-      $inner = $_.Exception.InnerException
-      while ($inner) { $msg += " | $($inner.Message)"; $inner = $inner.InnerException }
-      Warn "server upload failing: $msg"
+      Warn "server upload failing: $(Expl-Err $_.Exception)"
       $script:UploadErr = $true
     }
   }
@@ -882,13 +910,7 @@ function Register-WithServer {
       -Body ($body | ConvertTo-Json -Compress) -ContentType 'application/json' `
       -Headers @{ $script:UploadMark = '1' } -TimeoutSec 8 | Out-Null
     return $true
-  } catch {
-    # Keep the whole chain: WebException hides the real cause (TLS, connect) in InnerException.
-    $script:RegErr = $_.Exception.Message
-    $inner = $_.Exception.InnerException
-    while ($inner) { $script:RegErr += " | $($inner.Message)"; $inner = $inner.InnerException }
-    return $false
-  }
+  } catch { $script:RegErr = Expl-Err $_.Exception; return $false }
 }
 
 # Set up the collector now that Get-AgentId / Register-WithServer are defined.

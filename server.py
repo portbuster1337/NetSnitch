@@ -508,7 +508,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         # agent push endpoints are open
         try:
-            d = json.loads(raw.decode("utf-8")) if raw else {}
+            # Tolerant on purpose: PowerShell 5.1 clients can emit control
+            # characters inside JSON strings and/or non-UTF-8 byte sequences
+            # when a captured body is binary. Rejecting the whole batch loses
+            # the text records that rode along with it.
+            d = json.loads(raw.decode("utf-8", "replace"), strict=False) if raw else {}
         except Exception as e:
             self._send(400, json.dumps({"error": "bad json: %s" % e}))
             return
