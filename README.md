@@ -10,9 +10,10 @@ HTTPS in the clear.
 
 | File | Purpose |
 |------|---------|
-| `HttpCapture.ps1`   | Installer + headless activator + live reader |
+| `HttpCapture.ps1`   | Installer + headless activator + live reader (the agent) |
 | `HTTPDebuggerSvc.exe`| The capture service (intercepts via a WFP/NetFilter driver) |
 | `CtrlSM.sys`        | The network filter driver the service registers |
+| `server.py`         | Optional collector server + web UI (receives captures from agents) |
 
 ## Requirements
 
@@ -50,9 +51,36 @@ Run from an elevated prompt (or let it elevate itself):
 |-----------|---------|---------|
 | `-Seconds`   | `0` | Read duration; `0` = until Ctrl+C |
 | `-TrimBody`  | `0` | Trim each body to N chars; `0` = whole body |
+| `-Server`    | `''`| Stream captures as JSON to a collector (e.g. `http://host:8771`) |
 | `-NoInstall` | off | Skip install/start, just arm + read |
 | `-SelfTest`  | off | Emit sample HTTP/HTTPS requests in the background |
 | `-Uninstall` | off | Stop and delete the service, then exit |
+
+## Central collector (optional)
+
+Run `server.py` on any machine to collect captures from many agents and browse
+them in a web UI (Python 3, standard library only):
+
+```bash
+python3 server.py --port 8771
+```
+
+It prints a **one-time login password** and stores everything in **SQLite**
+(`captures.db`). Point agents at it:
+
+```powershell
+.\HttpCapture.ps1 -Server http://<collector-host>:8771
+```
+
+- Each machine is identified by a **stable agent id** (a hash of its MachineGuid +
+  SMBIOS UUID), so re-runs never create duplicate agents.
+- The home page lists agents; click one to see its captures. Each entry shows the
+  **site's favicon** (fetched and cached by the server), method, URL, status,
+  process and time, and expands to the full request/response headers and bodies.
+- Only complete request+response pairs are shown; the agent's own uploads and
+  one-sided/orphan records are filtered out.
+
+Server options: `--host`, `--port`, `--data <sqlite file>`, `--password <pw>`.
 
 ## How it works
 

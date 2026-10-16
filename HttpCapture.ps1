@@ -37,6 +37,7 @@
 param(
   [int]$Seconds = 0,
   [int]$TrimBody = 0,        # 0 = show the whole body; >0 = trim each body to N chars
+  [string]$Server = '',     # collector URL, e.g. http://host:8771 - stream captures there as JSON
   [switch]$NoInstall,
   [switch]$Uninstall,
   [switch]$SelfTest         # generate a few HTTP/HTTPS requests so there is traffic to show
@@ -468,12 +469,33 @@ function Print-Txn($c) {
   if ($c.ResBody.Length)  { Emit-Body '< RESPONSE BODY' $c.ResBody ([ConsoleColor]::Green) }
 }
 
-# The service writes a transaction's records (request, response headers, body) as
-# one tight burst, so once the ring goes quiet for a moment every transaction in
-# hand is complete. Flush them all then.
-function Flush-All {
-  foreach ($key in @($script:txns.Keys)) { Print-Txn $script:txns[$key] }
-  $script:txns.Clear()
+function Now-Ms { [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) }
+
+# A transaction's records arrive as a burst, but a request and its response can be
+# seconds apart on long-lived connections. So: hold each transaction until it has
+# gone quiet (SETTLE ms since its last record), then emit it ONLY if it is a
+# complete request+response pair; drop one-sided transactions after GRACE ms.
+$script:Settle = 500
+$script:Grace  = 2500
+
+function Flush-Settled([bool]$final) {
+  $now = Now-Ms
+  $send = @()
+  foreach ($key in @($script:txns.Keys)) {
+    $c = $script:txns[$key]
+    if ($Server -and (Is-ServerTxn $c)) { $script:txns.Remove($key); continue }
+    $hasReq  = [bool]($c.Method -or $c.Url -or $c.ReqHeaders)
+    $hasResp = [bool]($c.ResHeaders -or $c.ResBody -or $c.Status)
+    $quiet   = ($now - $c.Updated) -ge $script:Settle
+    if ($hasReq -and $hasResp -and ($quiet -or $final)) {
+      Print-Txn $c
+      if ($Server) { $send += $c }
+      $script:txns.Remove($key)
+    } elseif ($final -or (($now - $c.First) -ge $script:Grace)) {
+      $script:txns.Remove($key)                 # one-sided and out of time - drop it
+    }
+  }
+  if ($Server -and $send.Count) { Send-Batch $send }
 }
 
 function Ingest([string[]]$fields, [uint32]$id, [int]$tag) {
@@ -482,9 +504,11 @@ function Ingest([string[]]$fields, [uint32]$id, [int]$tag) {
   else {
     $script:txn++
     $t = @{ Num = $script:txn; Proc=''; User=''; Host=''; Url=''; Method='';
-            ReqHeaders=''; ReqBody=''; ResHeaders=''; ResBody=''; Status=''; SawResp=$false }
+            ReqHeaders=''; ReqBody=''; ResHeaders=''; ResBody=''; Status=''; SawResp=$false;
+            First=(Now-Ms); Updated=(Now-Ms) }
     $script:txns[$key] = $t
   }
+  $t.Updated = Now-Ms
   # The record tag says which half a loose body belongs to: 1 = request body,
   # 3 = response body. Far more reliable than guessing from order.
   if ($tag -ge 2) { $t.SawResp = $true }
@@ -523,10 +547,103 @@ function Ingest-Body([uint32]$id, [int]$tag, [string]$text) {
   else {
     $script:txn++
     $t = @{ Num = $script:txn; Proc=''; User=''; Host=''; Url=''; Method='';
-            ReqHeaders=''; ReqBody=''; ResHeaders=''; ResBody=''; Status=''; SawResp=$false }
+            ReqHeaders=''; ReqBody=''; ResHeaders=''; ResBody=''; Status=''; SawResp=$false;
+            First=(Now-Ms); Updated=(Now-Ms) }
     $script:txns[$key] = $t
   }
+  $t.Updated = Now-Ms
   if ($tag -eq 1) { $t.ReqBody += $text } else { $t.ResBody += $text; $t.SawResp = $true }
+}
+
+# ---------------------------------------------------------------------------
+# Optional collector: when -Server is given, each transaction is also POSTed to
+# the server as JSON, tagged with a stable per-machine agent id.
+# ---------------------------------------------------------------------------
+# Deterministic per-machine id: a hash of stable system identifiers (the Windows
+# MachineGuid and the SMBIOS hardware UUID), so the same machine always maps to
+# the same agent - no duplicates, no saved-file dependency.
+function Get-AgentId {
+  $parts = New-Object System.Collections.Generic.List[string]
+  try {
+    $mg = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid
+    if ($mg) { $parts.Add("mg:$mg") }
+  } catch {}
+  try {
+    $uuid = (Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop).UUID
+    if ($uuid -and $uuid -notmatch '^0{8}-|FFFFFFFF') { $parts.Add("uuid:$uuid") }
+  } catch {}
+  try {
+    $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+    if ($cs.Domain)       { $parts.Add("dom:$($cs.Domain)") }
+  } catch {}
+  if ($parts.Count -eq 0) { $parts.Add("cn:$env:COMPUTERNAME") }   # last-resort fallback
+  $seed = ($parts -join '|').ToLowerInvariant()
+  $sha  = [System.Security.Cryptography.SHA256]::Create()
+  $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($seed))
+  $sha.Dispose()
+  $short = -join ($hash[0..5] | ForEach-Object { $_.ToString('x2') })   # 12 hex chars
+  return "$env:COMPUTERNAME-$short"
+}
+
+# The agent's own uploads travel over HTTPS/443 and are themselves intercepted by
+# the capture - a feedback loop. We tag every upload three ways (destination host,
+# a request header, and a body sentinel) and drop any captured transaction that
+# matches, so our uploads are never re-sent or shown.
+$script:UploadMark = 'X-HttpCapture-Upload'
+$script:UploadSentinel = '__hc_upload__'
+
+function Is-ServerTxn($c) {
+  if ($script:ServerHost) {
+    if (($c.Host -and $c.Host -like "*$($script:ServerHost)*") -or
+        ($c.Url  -and $c.Url  -like "*$($script:ServerHost)*")) { return $true }
+  }
+  if ($c.ReqHeaders -and $c.ReqHeaders -match $script:UploadMark)     { return $true }
+  if ($c.ReqBody    -and $c.ReqBody    -match $script:UploadSentinel) { return $true }
+  return $false
+}
+
+# Send all transactions from one flush in a single POST (far less self-traffic
+# than one request each).
+function Send-Batch($list) {
+  if (-not $list -or $list.Count -eq 0) { return }
+  $items = @()
+  foreach ($c in $list) {
+    $items += @{
+      ts = [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+      process = $c.Proc; user = $c.User; host = $c.Host; url = $c.Url
+      method = $c.Method; status = $c.Status
+      requestHeaders = $c.ReqHeaders; requestBody = $c.ReqBody
+      responseHeaders = $c.ResHeaders; responseBody = $c.ResBody
+    }
+  }
+  $body = @{
+    $script:UploadSentinel = 1
+    agentId = $script:AgentId; agentName = $script:AgentName; machine = $env:COMPUTERNAME
+    items = $items
+  } | ConvertTo-Json -Depth 5 -Compress
+  try {
+    Invoke-RestMethod -Method Post -Uri "$script:ServerBase/api/ingest" -Body $body `
+      -ContentType 'application/json' -Headers @{ $script:UploadMark = '1' } -TimeoutSec 10 | Out-Null
+  } catch { }
+}
+
+function Register-WithServer {
+  $body = @{ "$script:UploadSentinel" = 1; agentId = $script:AgentId; agentName = $script:AgentName; machine = $env:COMPUTERNAME }
+  try {
+    Invoke-RestMethod -Method Post -Uri "$script:ServerBase/api/agent" `
+      -Body ($body | ConvertTo-Json -Compress) -ContentType 'application/json' `
+      -Headers @{ $script:UploadMark = '1' } -TimeoutSec 5 | Out-Null
+  } catch { }
+}
+
+# Set up the collector now that Get-AgentId / Register-WithServer are defined.
+if ($Server) {
+  $script:ServerBase = $Server.TrimEnd('/')
+  try { $script:ServerHost = ([Uri]$Server).Host } catch { $script:ServerHost = '' }
+  $script:AgentId = Get-AgentId
+  $script:AgentName = $env:COMPUTERNAME
+  Register-WithServer
+  Ok "streaming captures to $script:ServerBase  (agent: $script:AgentId)"
 }
 
 # ---------------------------------------------------------------------------
@@ -543,14 +660,10 @@ try {
     $h = [HttpIpc]::ReadHeader($ring.Mem)
     if (-not $h.Valid) { Start-Sleep -Milliseconds 300; continue }
     if ($h.WriteCursor -eq $last) {
-      # Nothing new: flush completed exchanges after a short lull; flush whatever
-      # is left (e.g. a request whose response we never saw) after a longer one.
-      $idle += 120
-      if ($idle -ge 400 -and $script:txns.Count) { Flush-All }
+      if ($script:txns.Count) { Flush-Settled $false }   # emit settled complete pairs
       Start-Sleep -Milliseconds 120
       continue
     }
-    $idle = 0
     $from = if ($last -eq [uint32]::MaxValue) { $h.WriteCursor } else { $last + 1 }
     for ($seq = $from; $seq -le $h.WriteCursor; $seq++) {
       $slot = [uint32]($seq % $h.Capacity)
@@ -576,12 +689,11 @@ try {
         if ($segs.Count) { Ingest $segs $id $tag }
       }
     }
-    # Safety valve for sustained traffic with no lull, so memory stays bounded.
-    if ($script:txns.Count -ge 200) { Flush-All }
+    Flush-Settled $false     # emit any transactions that have gone quiet
     $last = $h.WriteCursor
   }
 } finally {
-  Flush-All
+  Flush-Settled $true
   if ($owned) { try { $mutex.ReleaseMutex() } catch {} }
   Write-Host ''
   Write-Host "[done] $($script:txn) transaction(s) shown" -ForegroundColor White
