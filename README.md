@@ -41,6 +41,9 @@ Run from an elevated prompt (or let it elevate itself):
 # Trim long bodies to N characters (default 0 = show the whole body)
 .\netsnitch.ps1 -TrimBody 2000
 
+# Only capture/show/send specific domains (matches subdomains too)
+.\netsnitch.ps1 -Domains google.com,github.com
+
 # Run continuously in a hidden background process (returns immediately)
 .\netsnitch.ps1 -Background -Server http://<collector-host>:8771
 
@@ -62,6 +65,7 @@ Run from an elevated prompt (or let it elevate itself):
 | `-Seconds`     | `0` | Read duration; `0` = until Ctrl+C |
 | `-TrimBody`    | `0` | Trim each body to N chars; `0` = whole body |
 | `-Server`      | `''`| Stream captures as JSON to a collector (e.g. `http://host:8771`) |
+| `-Domains`     | `''`| Only show/send transactions for these domains, e.g. `-Domains google.com,github.com`. Matches subdomains (`google.com` also matches `www.google.com`). Empty = all. |
 | `-NoInstall`   | off | Skip install/start, just arm + read |
 | `-SelfTest`    | off | Emit sample HTTP/HTTPS requests in the background |
 | `-Background`  | off | Detach and capture continuously in a hidden process, then return. Survives the launching console/SSH session closing. |
