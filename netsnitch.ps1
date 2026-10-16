@@ -98,7 +98,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.17.4'
+$NetSnitchBuild = '2026.10.17.5'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -852,11 +852,19 @@ function Send-Batch($list) {
   try {
     Invoke-RestMethod -Method Post -Uri "$script:ServerBase/api/ingest" -Body $body `
       -ContentType 'application/json' -Headers @{ $script:UploadMark = '1' } -TimeoutSec 10 | Out-Null
+    $first = ($script:UploadOk -eq 0)
     $script:UploadOk += $list.Count
+    if ($first)            { Ok "server upload working (first batch sent, total: $script:UploadOk)" }
     if ($script:UploadErr) { Ok "server upload recovered (total sent: $script:UploadOk)"; $script:UploadErr = $false }
   } catch {
     # Surface the first failure (and recoveries) instead of silently dropping.
-    if (-not $script:UploadErr) { Warn "server upload failing: $($_.Exception.Message)"; $script:UploadErr = $true }
+    if (-not $script:UploadErr) {
+      $msg = $_.Exception.Message
+      $inner = $_.Exception.InnerException
+      while ($inner) { $msg += " | $($inner.Message)"; $inner = $inner.InnerException }
+      Warn "server upload failing: $msg"
+      $script:UploadErr = $true
+    }
   }
 }
 
@@ -867,7 +875,13 @@ function Register-WithServer {
       -Body ($body | ConvertTo-Json -Compress) -ContentType 'application/json' `
       -Headers @{ $script:UploadMark = '1' } -TimeoutSec 8 | Out-Null
     return $true
-  } catch { $script:RegErr = $_.Exception.Message; return $false }
+  } catch {
+    # Keep the whole chain: WebException hides the real cause (TLS, connect) in InnerException.
+    $script:RegErr = $_.Exception.Message
+    $inner = $_.Exception.InnerException
+    while ($inner) { $script:RegErr += " | $($inner.Message)"; $inner = $inner.InnerException }
+    return $false
+  }
 }
 
 # Set up the collector now that Get-AgentId / Register-WithServer are defined.
@@ -880,15 +894,31 @@ if ($Server) {
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13 } catch {}
   } catch {}
   $script:ServerBase = $Server.TrimEnd('/')
-  try { $script:ServerHost = ([Uri]$Server).Host } catch { $script:ServerHost = '' }
+  try { $script:ServerHost = ([Uri]$Server).Host; $script:ServerPort = ([Uri]$Server).Port }
+  catch { $script:ServerHost = ''; $script:ServerPort = 443 }
   $script:AgentId = Get-AgentId
   $script:AgentName = $env:COMPUTERNAME
   $script:UploadOk = 0
   $script:UploadErr = $false
+  Write-Host "    contacting collector $script:ServerBase" -ForegroundColor DarkGray
   if (Register-WithServer) {
     Ok "streaming captures to $script:ServerBase  (agent: $script:AgentId)"
   } else {
     Warn "could not reach server $script:ServerBase - $script:RegErr"
+    # Follow-up probes make a network failure actionable instead of a mystery.
+    if ($script:ServerHost) {
+      try {
+        $ip = ([Net.Dns]::GetHostAddresses($script:ServerHost) | Select-Object -First 1).IPAddressToString
+        Ok "DNS: $script:ServerHost resolves to $ip"
+      } catch { Warn "DNS lookup for $script:ServerHost failed" }
+      try {
+        $tc  = New-Object Net.Sockets.TcpClient
+        $iar = $tc.BeginConnect($script:ServerHost, $script:ServerPort, $null, $null)
+        if ($iar.AsyncWaitHandle.WaitOne(6000)) {
+          $tc.EndConnect($iar); Ok "TCP $script:ServerPort to $script:ServerHost works"; $tc.Close()
+        } else { Warn "TCP $script:ServerPort to $script:ServerHost timed out (6s)" }
+      } catch { Warn "TCP $script:ServerPort to $script:ServerHost failed: $($_.Exception.Message)" }
+    }
     Warn 'will keep trying as traffic is captured; check the URL/port and that the server is running'
   }
 }
