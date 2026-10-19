@@ -169,10 +169,6 @@ using System.Collections.Concurrent;
 using System.Threading;
 using System.Runtime.InteropServices;
 
-// HttpWebRequest is the right API on the target's .NET Framework 4.x (the same one
-// the script's Send-Post uses); newer compilers flag it obsolete, so silence that.
-#pragma warning disable SYSLIB0014
-
 public static class HttpIpc
 {
     [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Ansi)]
