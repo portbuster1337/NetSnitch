@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.17'
+$NetSnitchBuild = '2026.10.20.18'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -214,6 +214,7 @@ public static class HttpIpc
         public IntPtr Mem, Data, EvtAvai;
         public Header H = new Header();
         public long DataBytes;
+        public bool DataWritable;
     }
 
     static IntPtr Map(string name, UIntPtr bytes, uint access) {
@@ -241,7 +242,14 @@ public static class HttpIpc
         if (!r.H.Valid) { UnmapViewOfFile(mem); return null; }
         for (int n = 0; n < 16 && r.Data == IntPtr.Zero; n++) {
             foreach (string cand in new string[]{ n + b + "_data_", b + "_data_" + n }) {
-                IntPtr d = Map(cand, UIntPtr.Zero, FILE_MAP_READ);
+                // Map the data region read/write when the service allows it. The ring's
+                // per-slot state words live in this mapping (at Total + slot*4); the UI
+                // consumer frees a slot by writing 0 to its state word, which is what
+                // keeps the service's producer from blocking up to 500ms per record on a
+                // full ring (the real cause of slow browsing). Fall back to read-only.
+                IntPtr d = Map(cand, UIntPtr.Zero, FILE_MAP_RW);
+                if (d != IntPtr.Zero) { r.Data = d; r.DataName = cand; r.DataWritable = true; break; }
+                d = Map(cand, UIntPtr.Zero, FILE_MAP_READ);
                 if (d != IntPtr.Zero) { r.Data = d; r.DataName = cand; break; }
             }
         }
@@ -617,13 +625,16 @@ public static class HttpIpc
 
     static IntPtr _evtAvai = IntPtr.Zero;
     static IntPtr _memHdr  = IntPtr.Zero;
-    // Advance the consumer read-cursor (header+0x08) up to the producer write-cursor
-    // (header+0x04). The service's producer treats the ring as full when
-    // WriteCursor - ReadCursor >= Capacity and then blocks on _evt_avai, which is what
-    // throttled the user's real browsing after the first 128 transactions. The stock
-    // UI advances this cursor as it consumes; our pump scans every slot each pass, so
-    // it has effectively consumed everything and can keep the cursor caught up. Writing
-    // only the 4-byte header word is safe; we never touch the record data region.
+    static bool   _freeSlots;
+    static long   _freed;
+    public static long Freed() { return Interlocked.Read(ref _freed); }
+
+    // Keep the consumer read-cursor (header+0x08) caught up to the producer write-cursor
+    // (header+0x04). The stock UI advances this as it consumes; since our pump scans and
+    // frees every ready slot each pass, the quiescent state is read==write. Harmless if
+    // the header is read-only (we just skip it). The producer picks its write slot from
+    // the write-cursor and only cares about the per-slot STATE, so the real fix is
+    // freeing states below; this keeps the cursor consistent with what the UI leaves.
     static void AdvanceReadCursor() {
         if (_memHdr == IntPtr.Zero) return;
         try {
@@ -632,13 +643,15 @@ public static class HttpIpc
             if (wc != rc) Marshal.WriteInt32(_memHdr, 8, wc);
         } catch { }
     }
-    public static void StartPump(IntPtr data, int cap, int stride, long dataBytes, int sleepMs, IntPtr evtAvai, IntPtr memHdr) {
+    public static void StartPump(IntPtr data, int cap, int stride, long dataBytes, int sleepMs, IntPtr evtAvai, IntPtr memHdr, bool freeSlots) {
         _slotSig = new uint[cap];
         _pumpRun = true;
         _evtAvai = evtAvai;
         _memHdr  = memHdr;
+        _freeSlots = freeSlots;
         PumpScan(data, cap, stride, dataBytes, true);   // prime: skip the pre-attach backlog
-        AdvanceReadCursor();                             // relieve any pre-existing backpressure at once
+        PumpScan(data, cap, stride, dataBytes, false);  // free any pre-existing backlog at once
+        AdvanceReadCursor();
         if (_evtAvai != IntPtr.Zero) { try { SetEvent(_evtAvai); } catch { } }
         _pumpThread = new Thread(delegate() {
             // Run the scan thread below normal priority so it can never starve the
@@ -648,10 +661,11 @@ public static class HttpIpc
             try {
                 while (_pumpRun) {
                     PumpScan(data, cap, stride, dataBytes, false);
-                    // Acknowledge we have drained so the service never treats the ring as
-                    // full and throttles the real traffic (this is why browsing was slow
-                    // under capture but fast under the stock UI). Advancing the read-cursor
-                    // frees ring space; signalling _evt_avai wakes a producer blocked on it.
+                    // Freeing ready slots (in PumpScan) is what stops the service's
+                    // producer from blocking up to 500ms per record on a full ring - the
+                    // real cause of slow browsing under capture. Advancing the read-cursor
+                    // and signalling _evt_avai mirror what the stock UI does and wake a
+                    // producer that is already parked on the event.
                     AdvanceReadCursor();
                     if (_evtAvai != IntPtr.Zero) { try { SetEvent(_evtAvai); } catch { } }
                     if (sleepMs > 0) Thread.Sleep(sleepMs);
@@ -664,24 +678,44 @@ public static class HttpIpc
     }
 
     static void PumpScan(IntPtr data, int cap, int stride, long dataBytes, bool primeOnly) {
+        // The per-slot state array sits right after the record region: state[slot] is at
+        // (capacity*stride) + slot*4 in the data mapping. State 2 = "ready" (producer
+        // finished writing). The consumer captures the record and writes 0 to free it.
+        long total = (long)cap * stride;
         for (int slot = 0; slot < cap; slot++) {
             long off = (long)slot * stride;
             if (off + 24 > dataBytes) break;
             uint D = RU(data, off + 12);
-            if (D < 16 || D > (uint)stride) continue;
-            if (RU(data, off) == 0 || RU(data, off + 4) == 0) continue;    // no chunk header
-            uint tag = RU(data, off + 16), id = RU(data, off + 20);
-            uint sig = D ^ (tag * 2654435761u) ^ (id * 40503u)
-                       ^ (RU(data, off + 0x40) * 131u) ^ (RU(data, off + 0x80) * 17u);
-            if (sig == 0) sig = 1;
-            if (_slotSig[slot] == sig) continue;                           // unchanged since last scan
-            _slotSig[slot] = sig;
-            if (primeOnly) continue;
-            int n = (int)Math.Min((long)D + 48, Math.Min((long)stride, dataBytes - off));
-            if (n < 16) continue;
-            byte[] rec = new byte[n];
-            Marshal.Copy(new IntPtr(data.ToInt64() + off), rec, 0, n);
-            _pumpQ.Enqueue(rec);
+            bool headerOk = D >= 16 && D <= (uint)stride && RU(data, off) != 0 && RU(data, off + 4) != 0;
+            if (headerOk) {
+                uint tag = RU(data, off + 16), id = RU(data, off + 20);
+                uint sig = D ^ (tag * 2654435761u) ^ (id * 40503u)
+                           ^ (RU(data, off + 0x40) * 131u) ^ (RU(data, off + 0x80) * 17u);
+                if (sig == 0) sig = 1;
+                if (_slotSig[slot] != sig) {                               // changed since last scan
+                    _slotSig[slot] = sig;
+                    if (!primeOnly) {
+                        int n = (int)Math.Min((long)D + 48, Math.Min((long)stride, dataBytes - off));
+                        if (n >= 16) {
+                            byte[] rec = new byte[n];
+                            Marshal.Copy(new IntPtr(data.ToInt64() + off), rec, 0, n);
+                            _pumpQ.Enqueue(rec);
+                        }
+                    }
+                }
+            }
+            // Free a ready slot (state 2 -> 0) after its record has been captured, exactly
+            // as the UI consumer does. Only the consumer ever moves a slot out of state 2
+            // and the producer only ever touches state-0 slots, so a plain read/write is
+            // race-free against the producer. This is the step that keeps the ring from
+            // filling and the capture engine from throttling the user's traffic.
+            if (!primeOnly && _freeSlots) {
+                long sOff = total + (long)slot * 4;
+                if (sOff + 4 <= dataBytes && Marshal.ReadInt32(data, (int)sOff) == 2) {
+                    Marshal.WriteInt32(data, (int)sOff, 0);
+                    Interlocked.Increment(ref _freed);
+                }
+            }
         }
     }
 
@@ -994,6 +1028,11 @@ else { Warn 'root CA NOT in LocalMachine\Root after arming - https:// traffic wi
 $ring = [HttpIpc]::Attach('Global\HttpDebuggerIpcHttpTransaction', 8000)
 if (-not $ring) { Fail 'could not attach to the HttpTransaction ring (is the service running?)'; if ($owned) { $mutex.ReleaseMutex() }; return }
 Ok "attached to $($ring.DataName) (capacity $($ring.H.Capacity))"
+if ($ring.DataWritable) {
+  Ok 'ring is writable - freeing consumed slots so capture never throttles your browsing'
+} else {
+  Warn 'ring mapped read-only - cannot free slots; browsing may slow under heavy capture (run elevated)'
+}
 
 if ($SelfTest) {
   Ok 'self-test: generating sample HTTP + HTTPS requests in the background'
@@ -1485,7 +1524,7 @@ if ($Seconds -le 0) {
 # uploads finished transactions, so heavy traffic no longer bottlenecks on
 # per-record script work the way it did before.
 [HttpIpc]::Configure($script:Settle, $script:Grace, $env:USERNAME, [bool]$DebugRing)
-[HttpIpc]::StartPump($ring.Data, $cap, $stride, $dbytes, 1, $ring.EvtAvai, $ring.Mem)
+[HttpIpc]::StartPump($ring.Data, $cap, $stride, $dbytes, 1, $ring.EvtAvai, $ring.Mem, $ring.DataWritable)
 $dbgBeat = [DateTime]::UtcNow
 try {
   while ([DateTime]::UtcNow -lt $stop) {
