@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.21'
+$NetSnitchBuild = '2026.10.20.22'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -775,6 +775,21 @@ public static class HttpIpc
     public static void StartUploader(string url, string mark, int timeoutSec) {
         _upUrl = url; _upMark = mark == null ? "" : mark; _upTimeoutMs = timeoutSec * 1000;
         _upRun = true;
+        // Accept the capture's MITM leaf cert from ANY thread. The script sets this
+        // callback to a PowerShell ScriptBlock, which only runs on a thread that owns a
+        // PowerShell runspace. The main thread has one (so the startup registration POST
+        // succeeds - the "last seen" ping), but THIS background uploader thread has none,
+        // so the ScriptBlock callback throws, TLS validation fails, and every data upload
+        // dies silently - exactly "agent seen, but no captures arrive". A native delegate
+        // has no such requirement and validates correctly on the uploader thread.
+        System.Net.ServicePointManager.ServerCertificateValidationCallback =
+            delegate(object s, System.Security.Cryptography.X509Certificates.X509Certificate c,
+                     System.Security.Cryptography.X509Certificates.X509Chain ch,
+                     System.Net.Security.SslPolicyErrors e) { return true; };
+        try { System.Net.ServicePointManager.SecurityProtocol |= System.Net.SecurityProtocolType.Tls12; } catch { }
+        try { System.Net.ServicePointManager.SecurityProtocol |= (System.Net.SecurityProtocolType)12288; } catch { } // Tls1.3
+        try { System.Net.ServicePointManager.Expect100Continue = false; } catch { }
+        try { System.Net.ServicePointManager.DefaultConnectionLimit = 64; } catch { }
         _upThread = new Thread(delegate() {
             try { Thread.CurrentThread.Priority = ThreadPriority.BelowNormal; } catch { }
             while (_upRun || !_upQ.IsEmpty) {
