@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.15'
+$NetSnitchBuild = '2026.10.20.16'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -211,7 +211,7 @@ public static class HttpIpc
 
     public class Ring {
         public string Base, DataName;
-        public IntPtr Mem, Data;
+        public IntPtr Mem, Data, EvtAvai;
         public Header H = new Header();
         public long DataBytes;
     }
@@ -243,6 +243,10 @@ public static class HttpIpc
         }
         if (r.Data == IntPtr.Zero) { UnmapViewOfFile(r.Mem); return null; }
         r.DataBytes = (long)r.H.Total + (long)r.H.Capacity * 4;
+        // The consumer->producer "space available" event. The service blocks on it
+        // when the ring looks full and the UI signals it after draining; we must do
+        // the same or the service backpressures and the real traffic slows down.
+        r.EvtAvai = OpenEventA(EVENT_ALL, false, b + "_evt_avai");
         return r;
     }
 
@@ -607,16 +611,27 @@ public static class HttpIpc
     static ConcurrentQueue<byte[]> _pumpQ = new ConcurrentQueue<byte[]>();
     static uint RU(IntPtr p, long o) { return (uint)Marshal.ReadInt32(p, (int)o); }
 
-    public static void StartPump(IntPtr data, int cap, int stride, long dataBytes, int sleepMs) {
+    static IntPtr _evtAvai = IntPtr.Zero;
+    public static void StartPump(IntPtr data, int cap, int stride, long dataBytes, int sleepMs, IntPtr evtAvai) {
         _slotSig = new uint[cap];
         _pumpRun = true;
+        _evtAvai = evtAvai;
         PumpScan(data, cap, stride, dataBytes, true);   // prime: skip the pre-attach backlog
         _pumpThread = new Thread(delegate() {
             // Run the scan thread below normal priority so it can never starve the
             // OS/ssh/services even under a heavy traffic storm.
             try { Thread.CurrentThread.Priority = ThreadPriority.BelowNormal; } catch { }
             timeBeginPeriod(1);
-            try { while (_pumpRun) { PumpScan(data, cap, stride, dataBytes, false); if (sleepMs > 0) Thread.Sleep(sleepMs); } }
+            try {
+                while (_pumpRun) {
+                    PumpScan(data, cap, stride, dataBytes, false);
+                    // Acknowledge we have drained so the service never treats the ring as
+                    // full and throttles the real traffic (this is why browsing was slow
+                    // under capture but fast under the stock UI, which signals this event).
+                    if (_evtAvai != IntPtr.Zero) { try { SetEvent(_evtAvai); } catch { } }
+                    if (sleepMs > 0) Thread.Sleep(sleepMs);
+                }
+            }
             finally { timeEndPeriod(1); }
         });
         _pumpThread.IsBackground = true;
@@ -1332,7 +1347,7 @@ if ($Seconds -le 0) {
 # uploads finished transactions, so heavy traffic no longer bottlenecks on
 # per-record script work the way it did before.
 [HttpIpc]::Configure($script:Settle, $script:Grace, $env:USERNAME, [bool]$DebugRing)
-[HttpIpc]::StartPump($ring.Data, $cap, $stride, $dbytes, 1)
+[HttpIpc]::StartPump($ring.Data, $cap, $stride, $dbytes, 1, $ring.EvtAvai)
 $dbgBeat = [DateTime]::UtcNow
 try {
   while ([DateTime]::UtcNow -lt $stop) {
