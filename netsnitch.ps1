@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.20'
+$NetSnitchBuild = '2026.10.20.21'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -1321,9 +1321,16 @@ $script:UploadMark = 'X-NetSnitch-Upload'
 $script:UploadSentinel = '__netsnitch_upload__'
 
 function Is-ServerTxn($c) {
+  # Destination-based match is the robust one: anything going to the collector host
+  # is our own upload (or the collector web UI), whatever the engine did to the
+  # request. The MITM re-frames our POST as HTTP/2, so the host shows up in the URL,
+  # the Host field, or an "x-exhdr-authority: <host>" / "host: <host>" header line -
+  # check all of them so a captured upload is never re-sent (which would loop).
   if ($script:ServerHost) {
-    if (($c.Host -and $c.Host -like "*$($script:ServerHost)*") -or
-        ($c.Url  -and $c.Url  -like "*$($script:ServerHost)*")) { return $true }
+    $sh = $script:ServerHost
+    if (($c.Host       -and $c.Host       -like "*$sh*") -or
+        ($c.Url        -and $c.Url        -like "*$sh*") -or
+        ($c.ReqHeaders -and $c.ReqHeaders -like "*$sh*")) { return $true }
   }
   if ($c.ReqHeaders -and $c.ReqHeaders -match $script:UploadMark)     { return $true }
   if ($c.ReqBody    -and $c.ReqBody    -match $script:UploadSentinel) { return $true }
