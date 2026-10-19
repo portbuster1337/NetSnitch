@@ -15,14 +15,18 @@
     3. Runs "HTTPDebuggerSvc.exe /install" (creates the service + the TLS root CA).
     4. Starts the service.
     5. Arms capture headlessly, exactly the way the UI does:
-         - acquires the Global\HttpDebuggerUiStarted mutex (poses as the UI), and
+         - acquires the Global\HttpDebuggerUiStarted mutex (poses as the UI),
+         - pushes the rules profile over the Global\HttpDebuggerIpcSettings
+           channel so the engine builds a live profile (the service never loads
+           settings.xml from disk into the engine; only this IPC push does), and
          - pushes EngineCommand selectors 4, 9, 11, 2 (install CA, build the
-           80/443 rules, apply them, user handshake).
+           80/443 rules, apply the profile, user handshake).
        Neither the mutex nor the commands alone start capture; together they do.
     6. Follows the HttpTransaction shared-memory ring and decodes each record.
 
   HTTPS is decrypted: selector 4 installs "HTTP DEBUGGER CA for DEBUG ONLY" into
-  LocalMachine\Root first, so the service's MITM presents a trusted leaf.
+  LocalMachine\Root so the service's MITM presents a trusted leaf, and the profile
+  push enables the engine's decrypt path (selector 11 apply is a no-op without it).
 
 .PARAMETER Seconds
   How long to read before exiting. 0 (default) = until Ctrl+C.
@@ -67,6 +71,43 @@ $storeDir    = Join-Path $programData 'HTTPDebuggerPro'
 $storePath   = Join-Path $storeDir 'settings.xml'
 $sc          = Join-Path $env:SystemRoot 'System32\sc.exe'
 
+# The rules profile. The service does NOT load settings.xml from disk into its
+# live engine; the on-disk file is only persistence. The active profile is set
+# ONLY when this document is pushed over the Global\HttpDebuggerIpcSettings
+# channel (the UI does this at startup). Without it the engine has no profile,
+# selector 11 (apply) is a no-op, and HTTPS is never decrypted. So we both write
+# it to disk (for parity) and push it over IPC during arming.
+$settingsXml = @'
+<HTTPDebuggerPro>
+  <RulesProfiles Version="1" ActiveId="profile-1" CatalogRevision="1" ActiveGeneration="1">
+    <Profile Id="profile-1" Name="Main">
+      <HttpFilter>
+        <Rule Id="1" Enabled="1" Name="capture" UrlMatch="0" Url="" App="" Method="" IpAddr="" CaptureOnly="0" ShowOnly="0"/>
+      </HttpFilter>
+      <AutoResponder>
+        <Rule Id="1" Enabled="0" Name="" UrlMatch="0" Url="" ResponseHeader="" ResponseContent="" ResponseFile=""/>
+      </AutoResponder>
+      <HostRedirector>
+        <Rule Id="1" Enabled="0" Name="" FromAddr="" FromHost="" ToAddr="" ToHost=""/>
+      </HostRedirector>
+      <HttpModifier>
+        <Rule Id="1" Enabled="0" Name="" UrlMatch="0" Url=""/>
+      </HttpModifier>
+      <TcpRedirector>
+        <Rule Id="1" Enabled="0" Name="" FromAddr="" ToAddr=""/>
+      </TcpRedirector>
+      <Highlighting>
+        <Rule Id="1" Enabled="0" Name="" UseRegex="0" DarkThemeColor="0" WhiteThemeColor="0" Bold="0" EntireRow="0" Column="0" Expression="0" Val1="" Val2=""/>
+      </Highlighting>
+    </Profile>
+  </RulesProfiles>
+  <HttpEngine IsAskedForChat="1" EnableAnalytics="1"/>
+  <HttpSubmitter Method="GET" Url="http://" Header="" Content="" File="">
+    <Rule Enabled="0" Name="" Method="GET" Url="http://" Header="" Content="" File=""/>
+  </HttpSubmitter>
+</HTTPDebuggerPro>
+'@
+
 # NB: must NOT be named 'Sc' - that collides with the built-in 'sc' alias for
 # Set-Content, which would shadow this function and prompt for -Value.
 function Invoke-ScExe { param([string[]]$a) (& $sc @a 2>&1) ; return $LASTEXITCODE }
@@ -100,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.17.9'
+$NetSnitchBuild = '2026.10.17.10'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -256,16 +297,51 @@ public static class HttpIpc
         if (he != IntPtr.Zero) { SetEvent(he); CloseHandle(he); }
         return "sel " + selector + " ok";
     }
-    public static string ArmCapture(string user) {
+    // Push the rules-profile document over Global\HttpDebuggerIpcSettings. The
+    // service's SettingsObserver parses this into the engine's live profile
+    // (engine+0x1f4). That profile is what selector 11 (apply) activates and
+    // what the engine's capture/decrypt worker requires; writing settings.xml to
+    // disk does NOT set it. The document body is [u32 xmlLen][xml bytes][u32 flag].
+    static string PushSettings(string xml) {
+        const string b = "Global\\HttpDebuggerIpcSettings";
+        byte[] x = Encoding.ASCII.GetBytes(xml == null ? "" : xml);
+        int bodyLen = 4 + x.Length + 4;
+        byte[] rec = new byte[16 + bodyLen];
+        BitConverter.GetBytes((uint)1).CopyTo(rec, 0);
+        BitConverter.GetBytes((uint)1).CopyTo(rec, 4);
+        BitConverter.GetBytes((uint)bodyLen).CopyTo(rec, 8);
+        BitConverter.GetBytes((uint)bodyLen).CopyTo(rec, 12);
+        BitConverter.GetBytes((uint)x.Length).CopyTo(rec, 16);        // body+0: xml length
+        x.CopyTo(rec, 20);                                            // body+4: xml bytes
+        BitConverter.GetBytes((uint)1).CopyTo(rec, 20 + x.Length);    // body+...: apply flag
+        IntPtr h = OpenFileMappingA(FILE_MAP_RW, false, b + "_data_0");
+        if (h == IntPtr.Zero) return "settings open win32=" + Marshal.GetLastWin32Error();
+        IntPtr p = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, UIntPtr.Zero);
+        if (p == IntPtr.Zero) { CloseHandle(h); return "settings map win32=" + Marshal.GetLastWin32Error(); }
+        Marshal.Copy(rec, 0, p, rec.Length);
+        Marshal.WriteInt32(p, (int)SLOT_STRIDE, 2);        // slot state = READY
+        UnmapViewOfFile(p); CloseHandle(h);
+        IntPtr hm = OpenFileMappingA(FILE_MAP_RW, false, b + "_mem");
+        if (hm != IntPtr.Zero) {
+            IntPtr pm = MapViewOfFile(hm, FILE_MAP_WRITE, 0, 0, UIntPtr.Zero);
+            if (pm != IntPtr.Zero) { int wc = Marshal.ReadInt32(pm, 4); Marshal.WriteInt32(pm, 4, wc + 1); UnmapViewOfFile(pm); }
+            CloseHandle(hm);
+        }
+        IntPtr he = OpenEventA(EVENT_ALL, false, b + "_evt_filled");
+        if (he != IntPtr.Zero) { SetEvent(he); CloseHandle(he); }
+        return "settings ok (" + x.Length + " bytes)";
+    }
+    public static string ArmCapture(string user, string settingsXml) {
         byte[] ub = Encoding.ASCII.GetBytes(user == null ? "" : user);
         byte[] uext = new byte[8 + ub.Length];
         BitConverter.GetBytes((uint)ub.Length).CopyTo(uext, 0);
         ub.CopyTo(uext, 4);
+        string ss = PushSettings(settingsXml); System.Threading.Thread.Sleep(700); // load rules profile (enables apply + SSL decrypt)
         string s4 = Push(4, new byte[4]);  System.Threading.Thread.Sleep(1200); // install CA (HTTPS) first
         string s9 = Push(9, new byte[4]);  System.Threading.Thread.Sleep(300);  // build 80/443 rules
-        string s11 = Push(11, new byte[4]); System.Threading.Thread.Sleep(300); // apply/activate
+        string s11 = Push(11, new byte[4]); System.Threading.Thread.Sleep(300); // apply/activate the profile
         string s2 = Push(2, uext);         System.Threading.Thread.Sleep(300);  // user handshake
-        return s4 + "; " + s9 + "; " + s11 + "; " + s2;
+        return "settings " + ss + "; " + s4 + "; " + s9 + "; " + s11 + "; " + s2;
     }
 
     // Every meaningful field in a record (the metadata strings: user, process,
@@ -536,36 +612,7 @@ if (-not $NoInstall) {
   Step 'Writing the rules-profile store'
   if (-not (Test-Path $storeDir)) { New-Item -ItemType Directory -Path $storeDir -Force | Out-Null }
   if (-not (Test-Path $storePath)) {
-    @'
-<HTTPDebuggerPro>
-  <RulesProfiles Version="1" ActiveId="profile-1" CatalogRevision="1" ActiveGeneration="1">
-    <Profile Id="profile-1" Name="Main">
-      <HttpFilter>
-        <Rule Id="1" Enabled="1" Name="capture" UrlMatch="0" Url="" App="" Method="" IpAddr="" CaptureOnly="0" ShowOnly="0"/>
-      </HttpFilter>
-      <AutoResponder>
-        <Rule Id="1" Enabled="0" Name="" UrlMatch="0" Url="" ResponseHeader="" ResponseContent="" ResponseFile=""/>
-      </AutoResponder>
-      <HostRedirector>
-        <Rule Id="1" Enabled="0" Name="" FromAddr="" FromHost="" ToAddr="" ToHost=""/>
-      </HostRedirector>
-      <HttpModifier>
-        <Rule Id="1" Enabled="0" Name="" UrlMatch="0" Url=""/>
-      </HttpModifier>
-      <TcpRedirector>
-        <Rule Id="1" Enabled="0" Name="" FromAddr="" ToAddr=""/>
-      </TcpRedirector>
-      <Highlighting>
-        <Rule Id="1" Enabled="0" Name="" UseRegex="0" DarkThemeColor="0" WhiteThemeColor="0" Bold="0" EntireRow="0" Column="0" Expression="0" Val1="" Val2=""/>
-      </Highlighting>
-    </Profile>
-  </RulesProfiles>
-  <HttpEngine IsAskedForChat="1" EnableAnalytics="1"/>
-  <HttpSubmitter Method="GET" Url="http://" Header="" Content="" File="">
-    <Rule Enabled="0" Name="" Method="GET" Url="http://" Header="" Content="" File=""/>
-  </HttpSubmitter>
-</HTTPDebuggerPro>
-'@ | Set-Content -LiteralPath $storePath -Encoding Ascii
+    $settingsXml | Set-Content -LiteralPath $storePath -Encoding Ascii
     Ok "wrote $storePath"
   } else { Ok "store already present: $storePath" }
 
@@ -591,9 +638,10 @@ if (-not $NoInstall) {
 }
 
 # ---------------------------------------------------------------------------
-# Arm capture headlessly: hold the UI mutex + push EngineCommand 4,9,11,2.
+# Arm capture headlessly: hold the UI mutex, push the rules profile over
+# IpcSettings, then push EngineCommand 4,9,11,2.
 # ---------------------------------------------------------------------------
-Step 'Arming capture (mutex + EngineCommand 4,9,11,2)'
+Step 'Arming capture (mutex + IpcSettings profile + EngineCommand 4,9,11,2)'
 $mutexName = 'Global\HttpDebuggerUiStarted'
 try { $mutex = [System.Threading.Mutex]::OpenExisting($mutexName) }
 catch { $cn = $false; $mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$cn) }
@@ -616,7 +664,7 @@ try { if ($bootId -and (Test-Path $armSentinel) -and ((Get-Content $armSentinel 
 # Only push the arm commands if we own the mutex AND the service was not already
 # armed this boot. Otherwise attach read-only to the already-armed service.
 if ($owned -and -not $alreadyArmed) {
-  $arm = [HttpIpc]::ArmCapture($env:USERNAME)
+  $arm = [HttpIpc]::ArmCapture($env:USERNAME, $settingsXml)
   Ok "arm commands -> $arm"
   try { if ($bootId) { if (-not (Test-Path $storeDir)) { New-Item -ItemType Directory -Path $storeDir -Force | Out-Null }; Set-Content -Path $armSentinel -Value $bootId -Encoding Ascii } } catch {}
 } elseif ($alreadyArmed) {
