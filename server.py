@@ -733,6 +733,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/ingest":
             try:
+                # Flatten every line of the POST into one list, then ingest it as
+                # one transaction. A coalesced upload therefore costs one commit,
+                # not one commit per batch line.
+                items = []
                 for d in docs:
                     if isinstance(d, dict) and isinstance(d.get("items"), list):
                         aid = d.get("agentId"); aname = d.get("agentName"); machine = d.get("machine")
@@ -742,11 +746,12 @@ class Handler(BaseHTTPRequestHandler):
                             if aid and not it.get("agentId"): it["agentId"] = aid
                             if aname and not it.get("agentName"): it["agentName"] = aname
                             if machine and not it.get("machine"): it["machine"] = machine
-                        ingest_many(d["items"])
+                        items.extend(d["items"])
                     elif isinstance(d, list):
-                        ingest_many(d)
+                        items.extend(d)
                     else:
-                        ingest_many([d])
+                        items.append(d)
+                ingest_many(items)
                 self._send(200, json.dumps({"ok": True, "batches": len(docs)}))
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}))
