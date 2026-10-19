@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.16'
+$NetSnitchBuild = '2026.10.20.17'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -168,6 +168,10 @@ using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Threading;
 using System.Runtime.InteropServices;
+
+// HttpWebRequest is the right API on the target's .NET Framework 4.x (the same one
+// the script's Send-Post uses); newer compilers flag it obsolete, so silence that.
+#pragma warning disable SYSLIB0014
 
 public static class HttpIpc
 {
@@ -228,7 +232,11 @@ public static class HttpIpc
         Ring r = new Ring(); r.Base = b;
         IntPtr mem = IntPtr.Zero; int waited = 0;
         while (true) {
-            mem = Map(b + "_mem", (UIntPtr)0x30, FILE_MAP_READ);
+            // Map the header read/write when we can: advancing the read-cursor (so the
+            // service never backpressures real traffic) needs write access. Fall back
+            // to read-only if the service denied write, so capture still works.
+            mem = Map(b + "_mem", (UIntPtr)0x30, FILE_MAP_RW);
+            if (mem == IntPtr.Zero) mem = Map(b + "_mem", (UIntPtr)0x30, FILE_MAP_READ);
             if (mem != IntPtr.Zero) break;
             if (waited >= waitMs) return null;
             System.Threading.Thread.Sleep(50); waited += 50;
@@ -612,11 +620,30 @@ public static class HttpIpc
     static uint RU(IntPtr p, long o) { return (uint)Marshal.ReadInt32(p, (int)o); }
 
     static IntPtr _evtAvai = IntPtr.Zero;
-    public static void StartPump(IntPtr data, int cap, int stride, long dataBytes, int sleepMs, IntPtr evtAvai) {
+    static IntPtr _memHdr  = IntPtr.Zero;
+    // Advance the consumer read-cursor (header+0x08) up to the producer write-cursor
+    // (header+0x04). The service's producer treats the ring as full when
+    // WriteCursor - ReadCursor >= Capacity and then blocks on _evt_avai, which is what
+    // throttled the user's real browsing after the first 128 transactions. The stock
+    // UI advances this cursor as it consumes; our pump scans every slot each pass, so
+    // it has effectively consumed everything and can keep the cursor caught up. Writing
+    // only the 4-byte header word is safe; we never touch the record data region.
+    static void AdvanceReadCursor() {
+        if (_memHdr == IntPtr.Zero) return;
+        try {
+            int wc = Marshal.ReadInt32(_memHdr, 4);
+            int rc = Marshal.ReadInt32(_memHdr, 8);
+            if (wc != rc) Marshal.WriteInt32(_memHdr, 8, wc);
+        } catch { }
+    }
+    public static void StartPump(IntPtr data, int cap, int stride, long dataBytes, int sleepMs, IntPtr evtAvai, IntPtr memHdr) {
         _slotSig = new uint[cap];
         _pumpRun = true;
         _evtAvai = evtAvai;
+        _memHdr  = memHdr;
         PumpScan(data, cap, stride, dataBytes, true);   // prime: skip the pre-attach backlog
+        AdvanceReadCursor();                             // relieve any pre-existing backpressure at once
+        if (_evtAvai != IntPtr.Zero) { try { SetEvent(_evtAvai); } catch { } }
         _pumpThread = new Thread(delegate() {
             // Run the scan thread below normal priority so it can never starve the
             // OS/ssh/services even under a heavy traffic storm.
@@ -627,7 +654,9 @@ public static class HttpIpc
                     PumpScan(data, cap, stride, dataBytes, false);
                     // Acknowledge we have drained so the service never treats the ring as
                     // full and throttles the real traffic (this is why browsing was slow
-                    // under capture but fast under the stock UI, which signals this event).
+                    // under capture but fast under the stock UI). Advancing the read-cursor
+                    // frees ring space; signalling _evt_avai wakes a producer blocked on it.
+                    AdvanceReadCursor();
                     if (_evtAvai != IntPtr.Zero) { try { SetEvent(_evtAvai); } catch { } }
                     if (sleepMs > 0) Thread.Sleep(sleepMs);
                 }
@@ -670,6 +699,97 @@ public static class HttpIpc
     public static void StopPump() {
         _pumpRun = false;
         try { if (_pumpThread != null) _pumpThread.Join(500); } catch { }
+    }
+
+    // ---- background collector uploader -------------------------------------
+    // Uploads run on their OWN thread so a slow or flaky collector can never stall
+    // the capture/display loop. This matters most for a Cloudflare quick tunnel:
+    // it is HTTPS-only (port 443), and the capture engine itself intercepts and
+    // MITMs every outbound 443 connection - including our own upload - then has to
+    // re-originate it upstream through the slow tunnel. Under a burst that double
+    // hop makes a single POST's connect/handshake (GetRequestStream) exceed any
+    // sane timeout. Doing uploads off-thread with a generous timeout and one retry
+    // lets a batch that loses the race simply go again a moment later instead of
+    // failing the whole run. The ServicePointManager tweaks (Expect100 off, accept
+    // the MITM leaf cert, TLS1.2/1.3, no proxy) are process-global, so they already
+    // apply to the requests created here.
+    static string _upUrl = "", _upMark = "";
+    static int _upTimeoutMs = 30000;
+    static volatile bool _upRun;
+    static Thread _upThread;
+    static ConcurrentQueue<byte[]> _upQ = new ConcurrentQueue<byte[]>();
+    static long _upOk, _upDropped;
+    static int _upPending;
+    static volatile bool _upFailing;
+    static string _upLastErr = "";
+
+    public static void StartUploader(string url, string mark, int timeoutSec) {
+        _upUrl = url; _upMark = mark == null ? "" : mark; _upTimeoutMs = timeoutSec * 1000;
+        _upRun = true;
+        _upThread = new Thread(delegate() {
+            try { Thread.CurrentThread.Priority = ThreadPriority.BelowNormal; } catch { }
+            while (_upRun || !_upQ.IsEmpty) {
+                byte[] body;
+                if (!_upQ.TryDequeue(out body)) { Thread.Sleep(20); continue; }
+                Interlocked.Decrement(ref _upPending);
+                bool ok = false; string err = "";
+                for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+                    try { PostOnce(_upUrl, body); ok = true; }
+                    catch (Exception ex) { err = Flatten(ex); if (attempt == 0) Thread.Sleep(500); }
+                }
+                if (ok) { Interlocked.Increment(ref _upOk); _upFailing = false; }
+                else { _upLastErr = err; _upFailing = true; }
+            }
+        });
+        _upThread.IsBackground = true;
+        _upThread.Start();
+    }
+
+    public static void EnqueueUpload(byte[] body) {
+        if (body == null || body.Length == 0) return;
+        // Bounded queue: if the collector is badly backed up, drop the OLDEST batch
+        // so memory stays flat under a flood rather than growing without limit.
+        if (_upPending >= 256) {
+            byte[] junk;
+            if (_upQ.TryDequeue(out junk)) { Interlocked.Decrement(ref _upPending); Interlocked.Increment(ref _upDropped); }
+        }
+        _upQ.Enqueue(body);
+        Interlocked.Increment(ref _upPending);
+    }
+
+    static void PostOnce(string url, byte[] bytes) {
+        System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+        req.Method = "POST";
+        req.ContentType = "application/json; charset=utf-8";
+        req.KeepAlive = false;
+        req.ProtocolVersion = System.Net.HttpVersion.Version11;
+        try { req.ServicePoint.Expect100Continue = false; } catch { }
+        req.Proxy = null;
+        req.Timeout = _upTimeoutMs;
+        req.ReadWriteTimeout = _upTimeoutMs;
+        if (_upMark.Length > 0) { try { req.Headers.Add(_upMark, "1"); } catch { } }
+        req.ContentLength = bytes.Length;
+        using (var rs = req.GetRequestStream()) rs.Write(bytes, 0, bytes.Length);
+        using (System.Net.HttpWebResponse resp = (System.Net.HttpWebResponse)req.GetResponse()) {
+            int sc = (int)resp.StatusCode;
+            if (sc < 200 || sc >= 300) throw new Exception("HTTP " + sc);
+        }
+    }
+
+    static string Flatten(Exception ex) {
+        string m = ex.Message; Exception inner = ex.InnerException;
+        while (inner != null) { m += " | " + inner.Message; inner = inner.InnerException; }
+        return m;
+    }
+
+    public static long UpOk()      { return Interlocked.Read(ref _upOk); }
+    public static long UpDropped() { return Interlocked.Read(ref _upDropped); }
+    public static int  UpPending() { return _upPending; }
+    public static bool UpFailing() { return _upFailing; }
+    public static string UpLastErr() { return _upLastErr; }
+    public static void StopUploader() {
+        _upRun = false;
+        try { if (_upThread != null) _upThread.Join(4000); } catch { }
     }
 }
 '@
@@ -1227,31 +1347,44 @@ function Send-Batch($list) {
     agentId = $script:AgentId; agentName = $script:AgentName; machine = $env:COMPUTERNAME
     items = $items
   } | ConvertTo-Json -Depth 5 -Compress
-  try {
-    # Pre-encode to UTF-8: PowerShell 5.1 does not reliably encode string bodies
-    # as UTF-8, which would corrupt every non-ASCII byte of a binary capture.
-    $bytes = [Text.Encoding]::UTF8.GetBytes($body)
-    Send-Post "$script:ServerBase/api/ingest" $bytes 20
-    $first = ($script:UploadOk -eq 0)
-    $script:UploadOk += $list.Count
-    if ($first)            { Ok "server upload working (first batch sent, total: $script:UploadOk)" }
-    # One-time confirmation that https records are flowing end to end; after
-    # this the collector UI is the place to watch them.
-    if (-not $script:SentHttps) {
-      $h = $list | Where-Object { $_.Url -like 'https://*' } | Select-Object -First 1
-      if ($h) {
-        $script:SentHttps = $true
-        $u = [string]$h.Url; if ($u.Length -gt 110) { $u = $u.Substring(0, 110) + '...' }
-        Ok "https capture uploaded to collector (first: $u)"
-      }
-    }
-    if ($script:UploadErr) { Ok "server upload recovered (total sent: $script:UploadOk)"; $script:UploadErr = $false }
-  } catch {
-    # Surface the first failure (and recoveries) instead of silently dropping.
-    if (-not $script:UploadErr) {
-      Warn "server upload failing: $(Expl-Err $_.Exception)"
-      $script:UploadErr = $true
-    }
+  # Pre-encode to UTF-8 (PowerShell 5.1 does not reliably encode string bodies as
+  # UTF-8, which would corrupt every non-ASCII byte of a binary capture), then hand
+  # the batch to the background uploader thread and return at once. The capture loop
+  # never blocks on the network, so a slow collector cannot stall display or let the
+  # ring back up. Track whether an https record is in flight so the main loop can
+  # print the one-time end-to-end confirmation once the collector acknowledges.
+  $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+  [HttpIpc]::EnqueueUpload($bytes)
+  if (-not $script:SentHttps -and -not $script:QueuedHttps) {
+    if ($list | Where-Object { $_.Url -like 'https://*' } | Select-Object -First 1) { $script:QueuedHttps = $true }
+  }
+}
+
+# Surface upload health from the background thread on the main thread (safe for
+# colored Write-Host). Called once per display cycle.
+function Report-Upload {
+  if (-not $Server) { return }
+  $ok = [HttpIpc]::UpOk()
+  if ($ok -gt 0 -and -not $script:UploadWorkingShown) {
+    $script:UploadWorkingShown = $true
+    Ok "server upload working (collector acknowledged $ok batch(es))"
+  }
+  if ($ok -gt 0 -and $script:QueuedHttps -and -not $script:SentHttps) {
+    $script:SentHttps = $true
+    Ok 'https capture uploaded to collector'
+  }
+  $failing = [HttpIpc]::UpFailing()
+  if ($failing -and -not $script:UploadErr) {
+    $script:UploadErr = $true
+    Warn "server upload failing: $([HttpIpc]::UpLastErr())"
+  } elseif (-not $failing -and $script:UploadErr -and $ok -gt 0) {
+    $script:UploadErr = $false
+    Ok "server upload recovered (acknowledged $ok batch(es))"
+  }
+  $dropped = [HttpIpc]::UpDropped()
+  if ($dropped -gt 0 -and $dropped -ne $script:UploadDropShown) {
+    $script:UploadDropShown = $dropped
+    Warn "collector backed up: dropped $dropped oldest batch(es) to keep memory flat"
   }
 }
 
@@ -1295,6 +1428,15 @@ if ($Server) {
   $script:AgentName = $env:COMPUTERNAME
   $script:UploadOk = 0
   $script:UploadErr = $false
+  $script:UploadWorkingShown = $false
+  $script:QueuedHttps = $false
+  $script:SentHttps = $false
+  $script:UploadDropShown = 0
+  # Start the background uploader. A generous 30s per-attempt timeout plus one retry
+  # is what lets an upload survive the capture engine MITMing its own 443 traffic to
+  # a slow Cloudflare tunnel; since this runs off-thread it costs the capture loop
+  # nothing even when an attempt is slow.
+  [HttpIpc]::StartUploader("$script:ServerBase/api/ingest", $script:UploadMark, 30)
   Write-Host "    contacting collector $script:ServerBase" -ForegroundColor DarkGray
   if (Register-WithServer) {
     Ok "streaming captures to $script:ServerBase  (agent: $script:AgentId)"
@@ -1347,7 +1489,7 @@ if ($Seconds -le 0) {
 # uploads finished transactions, so heavy traffic no longer bottlenecks on
 # per-record script work the way it did before.
 [HttpIpc]::Configure($script:Settle, $script:Grace, $env:USERNAME, [bool]$DebugRing)
-[HttpIpc]::StartPump($ring.Data, $cap, $stride, $dbytes, 1, $ring.EvtAvai)
+[HttpIpc]::StartPump($ring.Data, $cap, $stride, $dbytes, 1, $ring.EvtAvai, $ring.Mem)
 $dbgBeat = [DateTime]::UtcNow
 try {
   while ([DateTime]::UtcNow -lt $stop) {
@@ -1357,6 +1499,7 @@ try {
       if (Test-DomainMatch $c) { Print-Txn $c; if ($Server) { $send += $c } }
     }
     if ($Server -and $send.Count) { Send-Batch $send }
+    Report-Upload
     if ($DebugRing) {
       foreach ($l in [HttpIpc]::DrainDbg()) { Write-Host $l -ForegroundColor DarkGray }
       if (([DateTime]::UtcNow - $dbgBeat).TotalMilliseconds -ge 5000) {
@@ -1374,6 +1517,8 @@ try {
     if (Test-DomainMatch $c) { Print-Txn $c; if ($Server) { $send += $c } }
   }
   if ($Server -and $send.Count) { Send-Batch $send }
+  # Let the uploader drain the final batches, then surface the last status.
+  if ($Server) { [HttpIpc]::StopUploader(); Report-Upload }
   if ($DebugRing) {
     foreach ($l in [HttpIpc]::DrainDbg()) { Write-Host $l -ForegroundColor DarkGray }
     Write-Host ("[dbg] ring records: " + [HttpIpc]::DbgSummary($false)) -ForegroundColor DarkGray
