@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.11'
+$NetSnitchBuild = '2026.10.20.12'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -861,6 +861,36 @@ function Ingest([string[]]$fields, [uint32]$id, [int]$tag) {
       $parts = $f -split "`r`n`r`n", 2
       $t.ReqHeaders = $parts[0].TrimEnd(); $t.Method = ($f -split '\s+', 2)[0]
       if ($parts.Count -gt 1 -and $parts[1]) { $t.ReqBody += $parts[1] }
+      continue
+    }
+    # HTTP/2 (most HTTPS): the engine drops the classic request line and carries
+    # the pseudo-headers as x-exhdr-method / x-exhdr-path / x-exhdr-authority, with
+    # x-exhdr-streamid present on both halves. Without this these records have no
+    # recognizable start line and get dumped into the body and then dropped, which
+    # is why http shows but https does not. Rebuild a request line from them.
+    if ($f -match '(?im)^x-exhdr-method:[ \t]*(\S+)') {
+      $t.Method = $Matches[1]
+      $auth = ''; $path = ''
+      if ($f -match '(?im)^x-exhdr-authority:[ \t]*([^\r\n]+)') { $auth = $Matches[1].Trim() }
+      if ($f -match '(?im)^x-exhdr-path:[ \t]*([^\r\n]+)')      { $path = $Matches[1].Trim() }
+      if (-not $t.Url -and ($auth -or $path)) { $t.Url = "https://$auth$path" }
+      $parts = $f -split "`r`n`r`n", 2
+      if (-not $t.ReqHeaders) { $t.ReqHeaders = $parts[0].TrimEnd() }
+      if ($parts.Count -gt 1 -and $parts[1]) { $t.ReqBody += $parts[1] }
+      continue
+    }
+    if ($f -match '(?im)^x-exhdr-streamid:' -and $f -match '(?im)^[A-Za-z][\w\-]*:[ \t]') {
+      $parts = $f -split "`r`n`r`n", 2
+      if ($toRes) {
+        if (-not $t.ResHeaders) { $t.ResHeaders = $parts[0].TrimEnd() }
+        $t.SawResp = $true
+        if (-not $t.Status -and $parts[0] -match '(?im)[:\s]status:?[ \t]*(\d{3})') { $t.Status = $Matches[1] }
+        if (-not $t.Status -and $parts[0] -match 'HTTP/\d\S*\s+(\d{3})')           { $t.Status = $Matches[1] }
+        if ($parts.Count -gt 1 -and $parts[1]) { $t.ResBody += $parts[1] }
+      } else {
+        if (-not $t.ReqHeaders) { $t.ReqHeaders = $parts[0].TrimEnd() }
+        if ($parts.Count -gt 1 -and $parts[1]) { $t.ReqBody += $parts[1] }
+      }
       continue
     }
     if ($f -match '^HTTP/\d\S*\s+\d{3}') {
