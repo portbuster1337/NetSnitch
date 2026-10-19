@@ -212,24 +212,124 @@ def _list_row(r):
             "resHeadersLen": r[10] or 0, "resBodyLen": r[11] or 0}
 
 
-def list_txns(aid, since, before, limit):
+def flt_from_qs(qs):
+    """Filter dict from the request query string (shared by list and stats)."""
+    def one(k):
+        return (qs.get(k) or [""])[0].strip()
+    return {"q": one("q"), "method": one("method"), "st": one("st"),
+            "process": one("process")}
+
+
+def _flt_clause(aid, flt):
+    """WHERE clause + args for one agent's transactions. The search text (q)
+    scans the whole stored record - URL, host, method, status, process, user and
+    every header and body - so a capture can be found by any string it contains.
+    method/status/process narrow it further. SQLite LIKE is case-insensitive for
+    ASCII by default."""
+    flt = flt or {}
+    where = ["agent_id=?"]
+    args = [aid]
+    q = (flt.get("q") or "").strip()
+    if q:
+        like = "%" + q + "%"
+        where.append("(url LIKE ? OR host LIKE ? OR method LIKE ? OR status LIKE ? OR "
+                     "process LIKE ? OR user LIKE ? OR req_headers LIKE ? OR req_body LIKE ? OR "
+                     "res_headers LIKE ? OR res_body LIKE ?)")
+        args += [like] * 10
+    method = (flt.get("method") or "").strip()
+    if method:
+        where.append("method=?")
+        args.append(method)
+    st = (flt.get("st") or "").strip()
+    if st:
+        where.append("status LIKE ?")
+        args.append(st + "%")
+    proc = (flt.get("process") or "").strip()
+    if proc:
+        where.append("process=?")
+        args.append(proc)
+    return " AND ".join(where), args
+
+
+def list_txns(aid, since, before, limit, flt=None):
     """Paginated, metadata-only listing.
       since>0  -> new rows with pk>since, ascending (live tail)
       before>0 -> older page with pk<before, descending (scroll back)
       neither  -> newest page, descending
+    flt applies the same filter used by stats_txns, so paging and charts agree.
     """
     limit = max(1, min(int(limit or 60), 500))
+    where, args = _flt_clause(aid, flt)
+    sql = "SELECT %s FROM txns WHERE %s" % (_LIST_COLS, where)
+    if since > 0:
+        sql += " AND pk>? ORDER BY pk ASC LIMIT ?"
+        args = args + [since, limit]
+    elif before > 0:
+        sql += " AND pk<? ORDER BY pk DESC LIMIT ?"
+        args = args + [before, limit]
+    else:
+        sql += " ORDER BY pk DESC LIMIT ?"
+        args = args + [limit]
     with DBLOCK:
-        if since > 0:
-            rows = DB.execute("SELECT %s FROM txns WHERE agent_id=? AND pk>? ORDER BY pk ASC LIMIT ?"
-                              % _LIST_COLS, (aid, since, limit)).fetchall()
-        elif before > 0:
-            rows = DB.execute("SELECT %s FROM txns WHERE agent_id=? AND pk<? ORDER BY pk DESC LIMIT ?"
-                              % _LIST_COLS, (aid, before, limit)).fetchall()
-        else:
-            rows = DB.execute("SELECT %s FROM txns WHERE agent_id=? ORDER BY pk DESC LIMIT ?"
-                              % _LIST_COLS, (aid, limit)).fetchall()
+        rows = DB.execute(sql, args).fetchall()
     return [_list_row(r) for r in rows]
+
+
+def stats_txns(aid, flt=None):
+    """Aggregates for the charts, over all of the agent's stored rows that match
+    the current filter, so the pies always describe what the grid is showing."""
+    where, args = _flt_clause(aid, flt)
+    with DBLOCK:
+        total = DB.execute("SELECT count(*) FROM txns WHERE " + where, args).fetchone()[0]
+        hosts = DB.execute("SELECT CASE WHEN host IS NULL OR host='' THEN '(none)' ELSE host END k,"
+                           " count(*) n FROM txns WHERE " + where +
+                           " GROUP BY k ORDER BY n DESC", args).fetchall()
+        methods = DB.execute("SELECT CASE WHEN method IS NULL OR method='' THEN '(none)' ELSE method END k,"
+                             " count(*) n FROM txns WHERE " + where +
+                             " GROUP BY k ORDER BY n DESC", args).fetchall()
+        status = DB.execute("SELECT CASE WHEN status LIKE '2%' THEN '2xx' WHEN status LIKE '3%' THEN '3xx'"
+                            " WHEN status LIKE '4%' THEN '4xx' WHEN status LIKE '5%' THEN '5xx'"
+                            " ELSE 'other' END k, count(*) n FROM txns WHERE " + where +
+                            " GROUP BY k ORDER BY n DESC", args).fetchall()
+        procs = DB.execute("SELECT CASE WHEN process IS NULL OR process='' THEN '(none)' ELSE process END k,"
+                           " count(*) n FROM txns WHERE " + where +
+                           " GROUP BY k ORDER BY n DESC", args).fetchall()
+        procs_all = DB.execute("SELECT DISTINCT process FROM txns WHERE " + where +
+                               " AND process IS NOT NULL AND process<>''"
+                               " ORDER BY process COLLATE NOCASE", args).fetchall()
+        span = DB.execute("SELECT min(ts), max(ts) FROM txns WHERE " + where, args).fetchone()
+        nbytes = DB.execute("SELECT coalesce(sum(coalesce(length(req_body),0) + "
+                            "coalesce(length(res_body),0)),0) FROM txns WHERE " + where,
+                            args).fetchone()[0]
+
+    def rows(rs, cap):
+        """Top entries plus one remainder slice, so the percentages still add up
+        to the full filtered total instead of only the entries shown."""
+        out = [{"k": r[0], "n": r[1]} for r in rs[:cap]]
+        if len(rs) > cap:
+            out.append({"k": "(other)", "n": total - sum(r[1] for r in rs[:cap])})
+        return out
+
+    return {"total": total, "bytes": nbytes, "hosts": rows(hosts, 9),
+            "methods": rows(methods, 7),
+            "status": [{"k": r[0], "n": r[1]} for r in status],
+            "processes": rows(procs, 7),
+            "processOptions": [r[0] for r in procs_all],
+            "first": span[0] or 0, "last": span[1] or 0}
+
+
+def delete_agent(aid):
+    """Remove an agent and every transaction stored for it. Returns True if the
+    agent existed. The login session is required by the caller."""
+    with DBLOCK:
+        try:
+            cur = DB.execute("DELETE FROM agents WHERE id=?", (aid,))
+            DB.execute("DELETE FROM txns WHERE agent_id=?", (aid,))
+            DB.commit()
+        except Exception:
+            DB.rollback()
+            raise
+    return cur.rowcount > 0
 
 
 def get_txn_full(aid, pk):
@@ -364,9 +464,9 @@ margin-bottom:8px;overflow:hidden}
 pre{margin:0;background:#0c121e;border:1px solid var(--line);border-radius:8px;
 padding:10px;overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-word;
 font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;color:#cfd8e8}
-.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px}
 input.search{background:var(--card);border:1px solid var(--line);border-radius:8px;
-color:var(--fg);padding:8px 12px;width:280px;outline:none}
+color:var(--fg);padding:8px 12px;width:280px;max-width:100%;outline:none}
 .empty{color:var(--mut);padding:40px;text-align:center}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block}
 .login{max-width:360px;margin:12vh auto;background:var(--card);border:1px solid var(--line);
@@ -377,6 +477,13 @@ color:var(--fg);padding:11px 12px;outline:none;font-size:14px}
 .login button{width:100%;margin-top:12px;background:var(--accent);border:0;border-radius:8px;
 color:#06101f;font-weight:700;padding:11px;cursor:pointer;font-size:14px}
 .err{color:var(--err);font-size:13px;margin-top:10px;min-height:18px}
+.cardbox{position:relative}
+.cardbox .card{padding-right:56px}
+.cardbox .del{position:absolute;top:8px;right:8px;background:var(--card2);border:1px solid var(--line);
+border-radius:6px;color:var(--mut);cursor:pointer;font-size:11px;line-height:1;padding:4px 7px;
+opacity:.35;transition:.15s}
+.cardbox:hover .del,.cardbox .del:focus{opacity:1}
+.cardbox .del:hover{color:var(--err);border-color:var(--err)}
 """
 
 LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8">
@@ -412,12 +519,27 @@ async function load(){
  var sig=JSON.stringify(a.map(function(x){return [x.id,x.count,x.last];}));
  if(sig===SIG){return;}SIG=sig;
  if(!a.length){em.style.display='block';box.innerHTML='';return;}em.style.display='none';
- box.innerHTML=a.map(function(x){return '<a class="card" href="/agent/'+encodeURIComponent(x.id)+'">'+
+ box.innerHTML=a.map(function(x){return '<div class="cardbox">'+
+  '<a class="card" href="/agent/'+encodeURIComponent(x.id)+'">'+
   '<div class="name">'+esc(x.name)+'</div>'+
   '<div class="meta">'+esc(x.machine||x.id)+'</div>'+
   '<div class="big">'+x.count+'</div>'+
-  '<div class="meta">captures &middot; last '+ago(x.last)+'</div></a>';}).join('');
+  '<div class="meta">captures &middot; last '+ago(x.last)+'</div></a>'+
+  '<button class="del" data-id="'+esc(x.id)+'" title="delete this agent and all of its captures">delete</button>'+
+  '</div>';}).join('');
 }
+async function delAgent(id){
+ if(!confirm('Delete '+id+' and all of its captures? This cannot be undone.'))return;
+ var r=null;
+ try{r=await fetch('/api/agent/'+encodeURIComponent(id),{method:'DELETE'});}catch(e){}
+ if(!r||r.status!==200){alert('delete failed'+(r?': HTTP '+r.status:''));return;}
+ SIG='';load();
+}
+document.getElementById('agents').addEventListener('click',function(e){
+ var b=e.target.closest?e.target.closest('.del'):null;
+ if(!b)return;e.preventDefault();e.stopPropagation();
+ delAgent(b.getAttribute('data-id'));
+});
 load();setInterval(load,3000);
 </script></body></html>"""
 
@@ -427,20 +549,49 @@ AGENT_HTML = """<!doctype html><html><head><meta charset="utf-8">
 .when{width:70px}.size{color:var(--mut);font-size:12px;white-space:nowrap;width:70px;text-align:right}
 #more{padding:14px;text-align:center;color:var(--mut);font-size:12px}
 .pausebtn{margin-left:10px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 12px;cursor:pointer;font-size:12px}
+.filters select,.toolbar select{background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:8px 10px;outline:none}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:14px}
+.chart{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+.chart h3{margin:0 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut)}
+.chart canvas{display:block;width:140px;height:140px;margin:0 auto;cursor:pointer}
+.legend{margin-top:8px;font-size:12px}
+.legend div{display:flex;gap:6px;align-items:center;padding:2px 0;cursor:pointer;color:var(--mut)}
+.legend div:hover{color:var(--fg)}
+.legend .sw{width:9px;height:9px;border-radius:2px;flex:0 0 9px}
+.legend .n{margin-left:auto;color:var(--fg)}
+.summary{color:var(--mut);font-size:12px;margin-bottom:12px}
 </style></head><body>
 <header><a href="/">&larr;</a><h1 id="aname">agent</h1>
 <span class="sub" id="ameta"></span>
-<span class="right"><a href="/logout">sign out</a></span></header>
+<span class="right"><button class="pausebtn" id="delagent">delete agent</button>
+<a href="/logout">sign out</a></span></header>
 <div class="wrap">
-<div class="toolbar"><input class="search" id="q" placeholder="filter loaded rows by url, method, status, process...">
+<div class="toolbar filters"><input class="search" id="q" placeholder="search url, headers, bodies, method, status, process...">
+<select id="fm"><option value="">all methods</option></select>
+<select id="fs"><option value="">all status</option><option value="2">2xx</option><option value="3">3xx</option><option value="4">4xx</option><option value="5">5xx</option></select>
+<select id="fp"><option value="">all processes</option></select>
+<button class="pausebtn" id="reset">reset</button>
 <button class="pausebtn" id="pause">pause live</button>
 <span class="sub" id="count"></span></div>
+<div id="charts" class="charts"></div>
+<div id="summary" class="summary"></div>
 <div id="list"></div>
 <div id="more"></div>
 <div id="empty" class="empty" style="display:none">No captures yet.</div></div>
 <script>
 var AID=decodeURIComponent(location.pathname.split('/agent/')[1]||'');
-var newestPk=0, oldestPk=0, loadingOlder=false, noMore=false, live=true, total=0;
+var newestPk=0, oldestPk=0, loadingOlder=false, noMore=false, live=true, total=0, matches=0;
+var filters={q:'',method:'',st:'',process:''};
+var PAL=['#4f9dff','#3ecf8e','#f0b64b','#f05c5c','#c8a6ff','#7fd0ff','#ff9a9a','#9ad','#8fd0ff','#ffd58f'];
+function esc(s){return (s||'').replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function fquery(){
+ var p=[];
+ if(filters.q)p.push('q='+encodeURIComponent(filters.q));
+ if(filters.method)p.push('method='+encodeURIComponent(filters.method));
+ if(filters.st)p.push('st='+encodeURIComponent(filters.st));
+ if(filters.process)p.push('process='+encodeURIComponent(filters.process));
+ return p.length?('&'+p.join('&')):'';
+}
 function ago(ms){var s=(Date.now()-ms)/1000;if(s<60)return Math.floor(s)+'s ago';
 if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
 function sclass(st){var n=parseInt(st,10)||0;return n>=500?'s5':n>=400?'s4':n>=300?'s3':n>=200?'s2':'';}
@@ -479,18 +630,100 @@ function mkRow(t){
  };
  row.appendChild(head);row.appendChild(det);return row;
 }
-function applyFilter(){
- var q=document.getElementById('q').value.toLowerCase();var list=document.getElementById('list');
- var shown=0;
- for(var i=0;i<list.children.length;i++){var r=list.children[i];
-  var ok=!q||r.dataset.search.indexOf(q)>=0;r.style.display=ok?'':'none';if(ok)shown++;}
- document.getElementById('count').textContent=shown+' shown | '+total+' loaded';
+function updateCount(){
+ var s=total+' shown';
+ if(matches)s+=' of '+matches+' match'+(matches===1?'':'es');
+ document.getElementById('count').textContent=s;
+}
+function drawPie(cv,items,onPick){
+ var w=cv.width,h=cv.height,cx=w/2,cy=h/2,r=Math.min(w,h)/2-2;
+ var ctx=cv.getContext('2d');ctx.clearRect(0,0,w,h);
+ var tot=0;items.forEach(function(it){tot+=it.n;});
+ if(!tot){ctx.fillStyle='#28324a';ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.fill();cv.onclick=null;return;}
+ var a=-Math.PI/2;
+ items.forEach(function(it,i){var b=a+(it.n/tot)*Math.PI*2;
+  ctx.beginPath();ctx.moveTo(cx,cy);ctx.arc(cx,cy,r,a,b);ctx.closePath();
+  ctx.fillStyle=PAL[i%PAL.length];ctx.fill();a=b;});
+ cv.onclick=function(e){
+  var rect=cv.getBoundingClientRect();
+  var x=(e.clientX-rect.left)*(w/rect.width)-cx,y=(e.clientY-rect.top)*(h/rect.height)-cy;
+  var t=(Math.atan2(y,x)+Math.PI/2)/(Math.PI*2);if(t<0)t+=1;
+  var acc=0;
+  for(var i=0;i<items.length;i++){acc+=items[i].n;if(t<=acc/tot){onPick(items[i].k);return;}}
+ };
+}
+function fillChart(ch,items,onPick){
+ var tot=0;items.forEach(function(it){tot+=it.n;});
+ function pick(k){if(k!=='(none)'&&k!=='other'&&k!=='(other)')onPick(k);}
+ drawPie(ch.cv,items,pick);
+ ch.lg.innerHTML='';
+ if(!items.length){var d=document.createElement('div');d.textContent='no data';ch.lg.appendChild(d);return;}
+ items.forEach(function(it,i){
+  var d=document.createElement('div');
+  var sw=document.createElement('span');sw.className='sw';sw.style.background=PAL[i%PAL.length];
+  var k=document.createElement('span');k.textContent=it.k;
+  var n=document.createElement('span');n.className='n';n.textContent=it.n+' ('+Math.round(it.n*100/tot)+'%)';
+  d.appendChild(sw);d.appendChild(k);d.appendChild(n);
+  if(it.k==='(none)'||it.k==='other'||it.k==='(other)'){d.style.cursor='default';}
+  else{d.onclick=function(){pick(it.k);};}
+  ch.lg.appendChild(d);
+ });
+}
+function mkChart(title){
+ var box=document.createElement('div');box.className='chart';
+ var h=document.createElement('h3');h.textContent=title;
+ var cv=document.createElement('canvas');cv.width=150;cv.height=150;
+ var lg=document.createElement('div');lg.className='legend';
+ box.appendChild(h);box.appendChild(cv);box.appendChild(lg);
+ document.getElementById('charts').appendChild(box);
+ return {cv:cv,lg:lg};
+}
+var CH={host:mkChart('transactions by domain'),method:mkChart('by method'),
+ stat:mkChart('by status'),proc:mkChart('by process')};
+function populateMethods(items){
+ var known=['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS','CONNECT'];
+ items.forEach(function(it){if(it.k!=='(none)'&&known.indexOf(it.k)<0)known.push(it.k);});
+ var sel=document.getElementById('fm');var cur=sel.value;sel.innerHTML='';
+ var all=document.createElement('option');all.value='';all.textContent='all methods';sel.appendChild(all);
+ known.forEach(function(m){var o=document.createElement('option');o.value=m;o.textContent=m;sel.appendChild(o);});
+ sel.value=cur;
+}
+function populateProcesses(items){
+ var sel=document.getElementById('fp');var cur=sel.value;var opts=[''];
+ items.forEach(function(k){if(k!=='(none)'&&opts.indexOf(k)<0)opts.push(k);});
+ sel.innerHTML='';
+ opts.forEach(function(v){var o=document.createElement('option');o.value=v;o.textContent=v||'all processes';sel.appendChild(o);});
+ sel.value=opts.indexOf(cur)>=0?cur:'';
+}
+async function loadStats(){
+ try{var r=await fetch('/api/stats/'+encodeURIComponent(AID)+'?'+fquery().replace(/^&/,''));if(!r.ok)return;var s=await r.json();}catch(e){return;}
+ matches=s.total;updateCount();
+ fillChart(CH.host,s.hosts,function(k){document.getElementById('q').value=k;applyFilters();});
+ fillChart(CH.method,s.methods,function(k){document.getElementById('fm').value=k;applyFilters();});
+ fillChart(CH.stat,s.status,function(k){document.getElementById('fs').value=(k||'').charAt(0);applyFilters();});
+ fillChart(CH.proc,s.processes,function(k){document.getElementById('fp').value=k;applyFilters();});
+ populateMethods(s.methods);
+ if(!filters.q&&!filters.method&&!filters.st&&!filters.process)populateProcesses(s.processOptions||[]);
+ var sum=document.getElementById('summary');
+ var b=s.bytes?(' ('+fmtSize(s.bytes)+' of bodies)'):'';
+ if(s.total&&s.last){sum.textContent=s.total+' captures'+b+' in view - '+new Date(s.first).toLocaleString()+' to '+new Date(s.last).toLocaleString();}
+ else{sum.textContent=s.total+' captures'+b+' in view';}
+}
+function applyFilters(){
+ filters.q=document.getElementById('q').value.trim();
+ filters.method=document.getElementById('fm').value;
+ filters.st=document.getElementById('fs').value;
+ filters.process=document.getElementById('fp').value;
+ list.innerHTML='';newestPk=0;oldestPk=0;noMore=false;loadingOlder=false;total=0;
+ document.getElementById('more').textContent='';
+ document.getElementById('empty').style.display='none';
+ loadNewest();loadStats();
 }
 function updateTimes(){var w=document.querySelectorAll('.when');
  for(var i=0;i<w.length;i++){if(w[i].dataset.ts)w[i].textContent=ago(+w[i].dataset.ts);}}
 var list=document.getElementById('list');
 async function loadNewest(){
- try{var r=await fetch('/api/agent/'+encodeURIComponent(AID)+'?limit=60');
+ try{var r=await fetch('/api/agent/'+encodeURIComponent(AID)+'?limit=60'+fquery());
   if(r.status===401){location='/login';return;}var j=await r.json();}catch(e){return;}
  if(j.error){document.getElementById('aname').textContent='agent not found';return;}
  setMeta(j.agent);
@@ -498,28 +731,28 @@ async function loadNewest(){
   list.appendChild(mkRow(t));total++;});
  if(j.items.length<60)noMore=true;
  document.getElementById('empty').style.display=total?'none':'block';
- applyFilter();
+ updateCount();
 }
 async function loadOlder(){
  if(loadingOlder||noMore||!oldestPk)return;loadingOlder=true;
  document.getElementById('more').textContent='loading older...';
- try{var r=await fetch('/api/agent/'+encodeURIComponent(AID)+'?before='+oldestPk+'&limit=60');
+ try{var r=await fetch('/api/agent/'+encodeURIComponent(AID)+'?before='+oldestPk+'&limit=60'+fquery());
   if(r.status===401){location='/login';return;}var j=await r.json();}catch(e){loadingOlder=false;document.getElementById('more').textContent='';return;}
  if(!j.items.length){noMore=true;document.getElementById('more').textContent='- end -';loadingOlder=false;return;}
  j.items.forEach(function(t){if(!oldestPk||t.id<oldestPk)oldestPk=t.id;list.appendChild(mkRow(t));total++;});
  if(j.items.length<60)noMore=true;
  document.getElementById('more').textContent=noMore?'- end -':'';
- applyFilter();loadingOlder=false;
+ updateCount();loadingOlder=false;
 }
 async function loadNew(){
  if(!live||!newestPk)return;
- try{var r=await fetch('/api/agent/'+encodeURIComponent(AID)+'?since='+newestPk+'&limit=300');
+ try{var r=await fetch('/api/agent/'+encodeURIComponent(AID)+'?since='+newestPk+'&limit=300'+fquery());
   if(r.status===401){location='/login';return;}var j=await r.json();}catch(e){return;}
  if(j.agent)setMeta(j.agent);
  if(j.items.length){
   var atTop=window.scrollY<60;var before=document.body.scrollHeight;
   j.items.forEach(function(t){if(t.id>newestPk)newestPk=t.id;list.insertBefore(mkRow(t),list.firstChild);total++;});
-  applyFilter();
+  updateCount();
   if(!atTop){window.scrollBy(0,document.body.scrollHeight-before);}  // keep scroll position when not at top
  }
  updateTimes();
@@ -528,10 +761,24 @@ async function loadNew(){
 window.addEventListener('scroll',function(){
  if(window.innerHeight+window.scrollY>=document.body.scrollHeight-400){loadOlder();}
 });
-document.getElementById('q').addEventListener('input',applyFilter);
+var qt=null;
+document.getElementById('q').addEventListener('input',function(){clearTimeout(qt);qt=setTimeout(applyFilters,400);});
+document.getElementById('fm').addEventListener('change',applyFilters);
+document.getElementById('fs').addEventListener('change',applyFilters);
+document.getElementById('fp').addEventListener('change',applyFilters);
+document.getElementById('reset').addEventListener('click',function(){
+ document.getElementById('q').value='';document.getElementById('fm').value='';
+ document.getElementById('fs').value='';document.getElementById('fp').value='';applyFilters();});
 document.getElementById('pause').addEventListener('click',function(){
  live=!live;this.textContent=live?'pause live':'resume live';});
-loadNewest();setInterval(loadNew,3000);setInterval(updateTimes,15000);
+document.getElementById('delagent').addEventListener('click',async function(){
+ if(!confirm('Delete '+AID+' and all of its captures? This cannot be undone.'))return;
+ var r=null;
+ try{r=await fetch('/api/agent/'+encodeURIComponent(AID),{method:'DELETE'});}catch(e){}
+ if(r&&r.status===200){location='/';}else{alert('delete failed'+(r?': HTTP '+r.status:''));}
+});
+loadNewest();loadStats();setInterval(loadNew,3000);setInterval(updateTimes,15000);
+setInterval(function(){if(live)loadStats();},15000);
 </script></body></html>"""
 
 
@@ -659,6 +906,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, json.dumps({"error": "not found"}))
             else:
                 self._send(200, json.dumps(t))
+        elif path.startswith("/api/stats/"):
+            aid = unquote(path[len("/api/stats/"):])
+            qs = parse_qs(urlparse(self.path).query)
+            if agent_meta(aid) is None:
+                self._send(404, json.dumps({"error": "no such agent"}))
+            else:
+                self._send(200, json.dumps(stats_txns(aid, flt_from_qs(qs))))
         elif path.startswith("/api/agent/"):
             aid = unquote(path[len("/api/agent/"):])
             qs = parse_qs(urlparse(self.path).query)
@@ -676,7 +930,7 @@ class Handler(BaseHTTPRequestHandler):
                 since = _qint("since")
                 before = _qint("before")
                 limit = _qint("limit")
-                items = list_txns(aid, since, before, limit)
+                items = list_txns(aid, since, before, limit, flt_from_qs(qs))
                 self._send(200, json.dumps({
                     "agent": meta, "items": items,
                     "mode": "since" if since > 0 else "page"}))
@@ -687,6 +941,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, data, ctype or "image/png")
             else:
                 self._send(200, DEFAULT_ICON, "image/svg+xml")
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        if not self._authed():
+            self._send(401, json.dumps({"error": "auth required"}))
+            return
+        if path.startswith("/api/agent/"):
+            aid = unquote(path[len("/api/agent/"):])
+            if aid and delete_agent(aid):
+                self._send(200, json.dumps({"ok": True}))
+            else:
+                self._send(404, json.dumps({"error": "no such agent"}))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 

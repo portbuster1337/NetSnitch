@@ -131,22 +131,33 @@ Then point any number of agents at it (continuously / at boot, if you like):
   so agents don't need the password.
 - **Stable agent id.** Each machine is identified by a hash of its MachineGuid +
   SMBIOS UUID, so re-runs/reboots never create duplicate agents.
-- **Paged web UI.** The home page lists agents; click one to see its captures. The
-  list loads only the newest 60 rows, and each row carries lightweight metadata
-  (method, URL, status, process, time, body size) rather than full headers and
-  bodies. Expanding a row fetches that one transaction's detail on demand.
-  Scrolling down loads older pages; the top polls for new rows every 3 s and can
-  be paused. Scroll position and open rows survive the updates.
+- **Paged web UI with filters and charts.** The home page lists agents; click one
+  to see its captures. The list loads only the newest 60 rows, and each row carries
+  lightweight metadata (method, URL, status, process, time, body size) rather than
+  full headers and bodies. Expanding a row fetches that one transaction's detail on
+  demand. Scrolling down loads older pages; the top polls for new rows every 3 s and
+  can be paused. Scroll position and open rows survive the updates.
+- **Full-record search and charts.** The agent page search box scans every stored
+  field, including request and response headers and bodies. Method, status class,
+  and process dropdowns narrow the list further, and all filters combine with the
+  live tail and paging. Four charts summarize the current result set by domain,
+  method, status class, and process; clicking a slice or legend entry applies that
+  value as a filter. Each agent card (and the agent page header) has a **delete**
+  control that removes the agent and all of its captures after a confirmation.
 - **Clean data.** Only complete request+response pairs are shown; the agent's own
   uploads and one-sided/orphan records are filtered out.
 
 **HTTP endpoints** (for reference): `GET /` and `/agent/<id>` (UI), `GET /login`
 `/logout`, `POST /login`; JSON API `GET /api/agents`;
 `GET /api/agent/<id>?limit=N` for the newest page, `?before=<pk>` for older pages,
-or `?since=<pk>` for the live tail; `GET /api/txn/<pk>?agent=<id>` for one
-transaction with full headers and bodies; `POST /api/agent` (register),
-`POST /api/ingest` (NDJSON upload batches; plain JSON still accepted), and
-`GET /fav?h=<host>` (favicon proxy).
+or `?since=<pk>` for the live tail, plus `q` (full-record search), `method`, `st`
+(status class, 2/3/4/5), and `process` filters; `GET /api/stats/<id>` returns
+counts grouped by domain, method, status class, and process for the same filters;
+`GET /api/txn/<pk>?agent=<id>` for one transaction with full headers and bodies;
+`POST /api/agent` (register),
+`POST /api/ingest` (NDJSON upload batches; plain JSON still accepted),
+`DELETE /api/agent/<id>` (delete an agent and its captures; session required),
+and `GET /fav?h=<host>` (favicon proxy).
 
 ## Architecture
 
