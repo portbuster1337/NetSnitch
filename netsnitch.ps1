@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.18'
+$NetSnitchBuild = '2026.10.20.19'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -654,12 +654,16 @@ public static class HttpIpc
         AdvanceReadCursor();
         if (_evtAvai != IntPtr.Zero) { try { SetEvent(_evtAvai); } catch { } }
         _pumpThread = new Thread(delegate() {
-            // Run the scan thread below normal priority so it can never starve the
-            // OS/ssh/services even under a heavy traffic storm.
-            try { Thread.CurrentThread.Priority = ThreadPriority.BelowNormal; } catch { }
+            // Run at Normal, the same class as the capture service. Freeing ring slots
+            // must keep pace with the service producing them; a below-normal pump falls
+            // behind under load, the ring fills, and the producer blocks ~500ms per
+            // record (the few-second stalls). At equal priority the two cooperate: we
+            // drain, then yield (Sleep(0)) so the service runs, then drain again.
+            try { Thread.CurrentThread.Priority = ThreadPriority.Normal; } catch { }
             timeBeginPeriod(1);
             try {
                 while (_pumpRun) {
+                    long before = Interlocked.Read(ref _freed);
                     PumpScan(data, cap, stride, dataBytes, false);
                     // Freeing ready slots (in PumpScan) is what stops the service's
                     // producer from blocking up to 500ms per record on a full ring - the
@@ -668,7 +672,12 @@ public static class HttpIpc
                     // producer that is already parked on the event.
                     AdvanceReadCursor();
                     if (_evtAvai != IntPtr.Zero) { try { SetEvent(_evtAvai); } catch { } }
-                    if (sleepMs > 0) Thread.Sleep(sleepMs);
+                    // Adaptive pacing: while a burst is flowing (we just freed slots),
+                    // keep draining with only a yield so the ring never backs up; when
+                    // idle, sleep a tick so we barely touch the CPU.
+                    bool busy = Interlocked.Read(ref _freed) != before;
+                    if (busy) Thread.Sleep(0);
+                    else if (sleepMs > 0) Thread.Sleep(sleepMs);
                 }
             }
             finally { timeEndPeriod(1); }
@@ -1509,15 +1518,22 @@ $dbytes = [long]$ring.DataBytes
 $stop   = if ($Seconds -gt 0) { [DateTime]::UtcNow.AddSeconds($Seconds) } else { [DateTime]::MaxValue }
 $flushAt = [DateTime]::UtcNow.AddMilliseconds(200)
 
-# For continuous (background/persistence) runs, drop this process (and the HTTP
-# service while it is armed) below normal priority. This is a hard safety net:
-# even if traffic spikes the capture work, it can never starve the OS, sshd, or
-# other services, so the machine stays responsive and reachable. (Bounded
-# -Seconds runs stay at normal priority.)
-if ($Seconds -le 0) {
-  try { [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
-  try { Get-Process -Name 'HTTPDebuggerSvc' -ErrorAction SilentlyContinue | ForEach-Object { $_.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } } catch {}
-}
+# Keep the capture service at its normal priority - it sits in the network data
+# path (it MITMs every connection), so dropping it directly stalls the user's
+# browsing under load; the stock UI never touches it. Run this process at Normal
+# too so the slot-freeing pump thread keeps pace with the service and the ring
+# never backs up (a below-normal process made the pump fall behind and the
+# producer block ~500ms per record - the few-second stalls). The pump yields
+# cooperatively (Sleep(0)) so it still cannot starve the OS or other services.
+try {
+  $svcProc = Get-Process -Name 'HTTPDebuggerSvc' -ErrorAction SilentlyContinue
+  foreach ($p in $svcProc) {
+    if ($p.PriorityClass -ne [System.Diagnostics.ProcessPriorityClass]::Normal) {
+      try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal } catch {}
+    }
+  }
+} catch {}
+try { [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal } catch {}
 # A native background thread re-scans the ring every 1ms and queues changed
 # records. Assembly - parsing, HTTP/1 and HTTP/2 classification, grouping, and
 # settling - runs in native code via Pump(); this loop only filters, prints, and
