@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.12'
+$NetSnitchBuild = '2026.10.20.13'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -417,6 +417,173 @@ public static class HttpIpc
             }
         } catch { }
         return Encoding.UTF8.GetString(body);   // plain text, or decompress failed
+    }
+
+    // ---- native transaction assembly ---------------------------------------
+    // Parse + classify + group + settle entirely in native code, the way the UI
+    // does it, so PowerShell only prints/uploads finished transactions instead of
+    // doing per-record regex work in script (the old bottleneck).
+    public class Txn {
+        public int Num; public uint Id;
+        public string Proc="", User="", Host="", Url="", Method="";
+        public string ReqHeaders="", ReqBody="", ResHeaders="", ResBody="", Status="";
+        public bool SawResp=false;
+        public long First, Updated;
+    }
+    const System.Text.RegularExpressions.RegexOptions RXO =
+        System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.IgnoreCase;
+    static readonly System.Text.RegularExpressions.Regex RxReq      = new System.Text.RegularExpressions.Regex(@"^[A-Z][A-Z]+ \S+ HTTP/\d", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxStatus   = new System.Text.RegularExpressions.Regex(@"^HTTP/\d\S*\s+\d{3}", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxStatusCd = new System.Text.RegularExpressions.Regex(@"^HTTP/\S+\s+(\d{3}[^\r\n]*)", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxH2Method = new System.Text.RegularExpressions.Regex(@"(?m)^x-exhdr-method:[ \t]*(\S+)", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxH2Auth   = new System.Text.RegularExpressions.Regex(@"(?m)^x-exhdr-authority:[ \t]*([^\r\n]+)", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxH2Path   = new System.Text.RegularExpressions.Regex(@"(?m)^x-exhdr-path:[ \t]*([^\r\n]+)", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxH2Stream = new System.Text.RegularExpressions.Regex(@"(?m)^x-exhdr-streamid:", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxHdrLine  = new System.Text.RegularExpressions.Regex(@"(?m)^[A-Za-z][\w\-]*:[ \t]", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxH2Stat1  = new System.Text.RegularExpressions.Regex(@"[:\s]status:?[ \t]*(\d{3})", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxH2Stat2  = new System.Text.RegularExpressions.Regex(@"HTTP/\d\S*\s+(\d{3})", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxHostPort = new System.Text.RegularExpressions.Regex(@"^\d{1,3}(\.\d{1,3}){3}:\d+$", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxUrl      = new System.Text.RegularExpressions.Regex(@"^https?://", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxProc     = new System.Text.RegularExpressions.Regex(@"\.(exe|dll)$", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxNum      = new System.Text.RegularExpressions.Regex(@"^\d{1,4}$", RXO);
+    static readonly System.Text.RegularExpressions.Regex RxShort    = new System.Text.RegularExpressions.Regex(@"^[\w.\-]{1,24}$", RXO);
+    static readonly string[] _crlf2 = new string[] { "\r\n\r\n" };
+
+    static readonly Dictionary<uint,Txn> _txns = new Dictionary<uint,Txn>();
+    static int _txnNum = 0;
+    static readonly Queue<Txn> _done = new Queue<Txn>();
+    static long _settle = 400, _grace = 2500;
+    static string _user = "";
+    static bool _debug = false;
+    static readonly Queue<string> _dbg = new Queue<string>();
+    static long _dT0,_dT1,_dT2,_dT3,_dTo,_dNoFields,_dNullBody,_dHttpsish;
+
+    public static void Configure(long settleMs, long graceMs, string user, bool debug) {
+        _settle = settleMs; _grace = graceMs; _user = user ?? ""; _debug = debug;
+    }
+    public static long NowMs() { return (long)(DateTime.UtcNow - new DateTime(1970,1,1,0,0,0,DateTimeKind.Utc)).TotalMilliseconds; }
+    public static int Created() { return _txnNum; }
+
+    static Txn GetTxn(uint id) {
+        Txn t;
+        if (!_txns.TryGetValue(id, out t)) { t = new Txn(); t.Num = ++_txnNum; t.Id = id; t.First = NowMs(); _txns[id] = t; }
+        t.Updated = NowMs();
+        return t;
+    }
+    static void IngestFields(string[] fields, uint id, int tag) {
+        Txn t = GetTxn(id);
+        if (tag >= 2) t.SawResp = true;
+        bool toRes = (tag == 3) || (tag != 1 && t.SawResp);
+        foreach (string f in fields) {
+            string trim = f.Trim();
+            if (RxReq.IsMatch(f)) {
+                string[] p = f.Split(_crlf2, 2, StringSplitOptions.None);
+                t.ReqHeaders = p[0].TrimEnd();
+                int sp = f.IndexOf(' '); t.Method = sp > 0 ? f.Substring(0, sp) : f;
+                if (p.Length > 1 && p[1].Length > 0) t.ReqBody += p[1];
+                continue;
+            }
+            var mm = RxH2Method.Match(f);
+            if (mm.Success) {
+                t.Method = mm.Groups[1].Value;
+                string auth = "", path = "";
+                var am = RxH2Auth.Match(f); if (am.Success) auth = am.Groups[1].Value.Trim();
+                var pm = RxH2Path.Match(f); if (pm.Success) path = pm.Groups[1].Value.Trim();
+                if (t.Url.Length == 0 && (auth.Length > 0 || path.Length > 0)) t.Url = "https://" + auth + path;
+                string[] p = f.Split(_crlf2, 2, StringSplitOptions.None);
+                if (t.ReqHeaders.Length == 0) t.ReqHeaders = p[0].TrimEnd();
+                if (p.Length > 1 && p[1].Length > 0) t.ReqBody += p[1];
+                continue;
+            }
+            if (RxH2Stream.IsMatch(f) && RxHdrLine.IsMatch(f)) {
+                string[] p = f.Split(_crlf2, 2, StringSplitOptions.None);
+                if (toRes) {
+                    if (t.ResHeaders.Length == 0) t.ResHeaders = p[0].TrimEnd();
+                    t.SawResp = true;
+                    if (t.Status.Length == 0) { var s1 = RxH2Stat1.Match(p[0]); if (s1.Success) t.Status = s1.Groups[1].Value; }
+                    if (t.Status.Length == 0) { var s2 = RxH2Stat2.Match(p[0]); if (s2.Success) t.Status = s2.Groups[1].Value; }
+                    if (p.Length > 1 && p[1].Length > 0) t.ResBody += p[1];
+                } else {
+                    if (t.ReqHeaders.Length == 0) t.ReqHeaders = p[0].TrimEnd();
+                    if (p.Length > 1 && p[1].Length > 0) t.ReqBody += p[1];
+                }
+                continue;
+            }
+            if (RxStatus.IsMatch(f)) {
+                string[] p = f.Split(_crlf2, 2, StringSplitOptions.None);
+                t.ResHeaders = p[0].TrimEnd(); t.SawResp = true;
+                var sc = RxStatusCd.Match(p[0]); if (sc.Success) t.Status = sc.Groups[1].Value.Trim();
+                if (p.Length > 1 && p[1].Length > 0) t.ResBody += p[1];
+                continue;
+            }
+            if (RxHostPort.IsMatch(trim)) { if (t.Host.Length == 0) t.Host = trim; continue; }
+            if (RxUrl.IsMatch(trim))      { if (t.Url.Length  == 0) t.Url  = trim; continue; }
+            if (RxProc.IsMatch(trim) && trim.IndexOf(' ') < 0 && trim.IndexOf('\t') < 0) { if (t.Proc.Length == 0) t.Proc = trim; continue; }
+            if (_user.Length > 0 && string.Equals(trim, _user, StringComparison.OrdinalIgnoreCase)) { if (t.User.Length == 0) t.User = trim; continue; }
+            if (RxNum.IsMatch(trim)) continue;
+            if (RxShort.IsMatch(trim) && t.User.Length == 0) { t.User = trim; continue; }
+            if (toRes) t.ResBody += f; else t.ReqBody += f;
+        }
+    }
+    static void IngestBody(uint id, int tag, string text) {
+        if (text == null || text.Trim().Length == 0) return;
+        Txn t = GetTxn(id);
+        if (tag == 1) t.ReqBody += text; else { t.ResBody += text; t.SawResp = true; }
+    }
+    static void IngestRecord(byte[] raw) {
+        if (raw.Length < 24) return;
+        int D = BitConverter.ToInt32(raw, 12);
+        int tag = BitConverter.ToInt32(raw, 16);
+        uint id = (uint)BitConverter.ToInt32(raw, 20);
+        if (_debug) DbgRecord(raw, tag, id, D);
+        if (tag == 1 || tag == 3) {
+            byte[] bb = ExtractBody(raw, D);
+            if (bb != null) IngestBody(id, tag, DecodeBody(bb));
+            else if (_debug) _dNullBody++;
+        } else {
+            string[] segs = Fields(raw, raw.Length);
+            if (segs.Length > 0) IngestFields(segs, id, tag);
+            else if (_debug) _dNoFields++;
+        }
+    }
+    static void FlushSettled(bool final) {
+        long now = NowMs();
+        List<uint> rm = new List<uint>();
+        foreach (var kv in _txns) {
+            Txn c = kv.Value;
+            bool hasReq  = c.Method.Length > 0 || c.Url.Length > 0 || c.ReqHeaders.Length > 0;
+            bool hasResp = c.ResHeaders.Length > 0 || c.ResBody.Length > 0 || c.Status.Length > 0;
+            bool quiet   = (now - c.Updated) >= _settle;
+            if (hasReq && hasResp && (quiet || final)) { _done.Enqueue(c); rm.Add(kv.Key); }
+            else if (final || (now - c.First) >= _grace) {
+                if (_debug) { string why = !hasReq ? "no-req" : (!hasResp ? "no-resp" : "grace"); _dbg.Enqueue("[dbg] drop #" + c.Num + " " + (final ? "final-" : "") + why + " | " + (c.Url.Length > 0 ? c.Url : (c.Host.Length > 0 ? c.Host : c.Method))); }
+                rm.Add(kv.Key);
+            }
+        }
+        for (int i = 0; i < rm.Count; i++) _txns.Remove(rm[i]);
+    }
+    // Drain the raw queue, assemble, settle, and return finished transactions.
+    public static Txn[] Pump(bool final) {
+        byte[] r;
+        while (_pumpQ.TryDequeue(out r)) IngestRecord(r);
+        FlushSettled(final);
+        List<Txn> o = new List<Txn>();
+        while (_done.Count > 0) o.Add(_done.Dequeue());
+        return o.ToArray();
+    }
+    static void DbgRecord(byte[] raw, int tag, uint id, int D) {
+        switch (tag) { case 0: _dT0++; break; case 1: _dT1++; break; case 2: _dT2++; break; case 3: _dT3++; break; default: _dTo++; break; }
+        int n = Math.Min(140, raw.Length - 16); var sb = new StringBuilder();
+        for (int i = 16; i < 16 + n; i++) { byte c = raw[i]; sb.Append((c >= 32 && c < 127) ? (char)c : '.'); }
+        string s = sb.ToString();
+        if (s.Contains("https://") || s.Contains(":443") || s.Contains("CONNECT") || s.Contains(":method") || s.Contains(":status") || s.Contains("x-exhdr")) _dHttpsish++;
+        _dbg.Enqueue(string.Format("[dbg] {0} tag={1} id={2} D={3} len={4} | {5}", DateTime.UtcNow.ToString("HH:mm:ss.fff"), tag, id, D, raw.Length, s));
+    }
+    public static string[] DrainDbg() { List<string> o = new List<string>(); while (_dbg.Count > 0) o.Add(_dbg.Dequeue()); return o.ToArray(); }
+    public static string DbgSummary(bool open) {
+        long tot = _dT0 + _dT1 + _dT2 + _dT3 + _dTo;
+        if (open) return string.Format("records={0} httpsish={1} no-fields={2} body-null={3} open-txns={4}", tot, _dHttpsish, _dNoFields, _dNullBody, _txns.Count);
+        return string.Format("tag0={0} tag1={1} tag2={2} tag3={3} other={4} | httpsish={5} no-fields={6} body-null={7}", _dT0, _dT1, _dT2, _dT3, _dTo, _dHttpsish, _dNoFields, _dNullBody);
     }
 
     // ---- background capture pump -------------------------------------------
@@ -785,7 +952,7 @@ function Show-RingRecord($raw, $tag, $id, $d) {
 # seconds apart on long-lived connections. So: hold each transaction until it has
 # gone quiet (SETTLE ms since its last record), then emit it ONLY if it is a
 # complete request+response pair; drop one-sided transactions after GRACE ms.
-$script:Settle = 500
+$script:Settle = 400
 $script:Grace  = 2500
 
 # When -Domains is set, keep only transactions whose host matches one of them.
@@ -1123,51 +1290,43 @@ if ($Seconds -le 0) {
   try { Get-Process -Name 'HTTPDebuggerSvc' -ErrorAction SilentlyContinue | ForEach-Object { $_.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } } catch {}
 }
 # A native background thread re-scans the ring every 1ms and queues changed
-# records; we just drain the queue here. That catches every transient request
-# record while using ~0.2% of one core (a no-sleep loop pins a whole core).
+# records. Assembly - parsing, HTTP/1 and HTTP/2 classification, grouping, and
+# settling - runs in native code via Pump(); this loop only filters, prints, and
+# uploads finished transactions, so heavy traffic no longer bottlenecks on
+# per-record script work the way it did before.
+[HttpIpc]::Configure($script:Settle, $script:Grace, $env:USERNAME, [bool]$DebugRing)
 [HttpIpc]::StartPump($ring.Data, $cap, $stride, $dbytes, 1)
+$dbgBeat = [DateTime]::UtcNow
 try {
   while ([DateTime]::UtcNow -lt $stop) {
-    $recs = [HttpIpc]::Drain()
-    foreach ($raw in $recs) {
-      if ($raw.Length -lt 24) { continue }
-      $d   = [System.BitConverter]::ToInt32($raw, 12)
-      $tag = [System.BitConverter]::ToInt32($raw, 16)              # 0=req 1=reqbody 2=resp 3=respbody
-      $id  = [uint32]([System.BitConverter]::ToInt32($raw, 20))    # transaction id (correlates req<->resp)
-      if ($DebugRing) { Show-RingRecord $raw $tag $id $d }
-      if ($tag -eq 1 -or $tag -eq 3) {
-        $bb = [HttpIpc]::ExtractBody($raw, $d)
-        if ($bb) { Ingest-Body $id $tag ([HttpIpc]::DecodeBody($bb)) }
-        elseif ($DebugRing) { $script:DbgNullBody++ }
-      } else {
-        $segs = [HttpIpc]::Fields($raw, $raw.Length)
-        if ($segs.Count) { Ingest $segs $id $tag }
-        elseif ($DebugRing) { $script:DbgNoFields++ }
+    $send = @()
+    foreach ($c in [HttpIpc]::Pump($false)) {
+      if ($Server -and (Is-ServerTxn $c)) { continue }
+      if (Test-DomainMatch $c) { Print-Txn $c; if ($Server) { $send += $c } }
+    }
+    if ($Server -and $send.Count) { Send-Batch $send }
+    if ($DebugRing) {
+      foreach ($l in [HttpIpc]::DrainDbg()) { Write-Host $l -ForegroundColor DarkGray }
+      if (([DateTime]::UtcNow - $dbgBeat).TotalMilliseconds -ge 5000) {
+        Write-Host ("[dbg] " + [HttpIpc]::DbgSummary($true)) -ForegroundColor DarkGray
+        $dbgBeat = [DateTime]::UtcNow
       }
     }
-    if ([DateTime]::UtcNow -ge $flushAt) {
-      Flush-Settled $false                                         # emit settled complete pairs
-      $flushAt = [DateTime]::UtcNow.AddMilliseconds(200)
-      if ($DebugRing -and ((Now-Ms - $script:DbgLastBeat) -ge 5000)) {
-        $tot = 0; foreach ($v in $script:DbgTagCounts.Values) { $tot += $v }
-        Write-Host ("[dbg] {0} records={1} httpsish={2} no-fields={3} body-null={4} open-txns={5}" -f `
-          ([DateTime]::UtcNow.ToString('HH:mm:ss')), $tot, $script:DbgHttpsish, $script:DbgNoFields, $script:DbgNullBody, $script:txns.Count) -ForegroundColor DarkGray
-        $script:DbgLastBeat = Now-Ms
-      }
-    }
-    Start-Sleep -Milliseconds 150                                  # drain cadence; the pump thread does the fast work
+    Start-Sleep -Milliseconds 40                                   # display cadence; the native layer does the heavy work
   }
 } finally {
   [HttpIpc]::StopPump()
-  Flush-Settled $true
+  $send = @()
+  foreach ($c in [HttpIpc]::Pump($true)) {                         # final flush: emit any paired transactions still open
+    if ($Server -and (Is-ServerTxn $c)) { continue }
+    if (Test-DomainMatch $c) { Print-Txn $c; if ($Server) { $send += $c } }
+  }
+  if ($Server -and $send.Count) { Send-Batch $send }
   if ($DebugRing) {
-    $parts = @()
-    foreach ($k in ($script:DbgTagCounts.Keys | Sort-Object)) { $parts += "tag$k=$($script:DbgTagCounts[$k])" }
-    if (-not $parts.Count) { $parts = @('none') }
-    Write-Host ("[dbg] ring records: {0} | httpsish={1} no-fields={2} body-null={3}" -f `
-      ($parts -join ' '), $script:DbgHttpsish, $script:DbgNoFields, $script:DbgNullBody) -ForegroundColor DarkGray
+    foreach ($l in [HttpIpc]::DrainDbg()) { Write-Host $l -ForegroundColor DarkGray }
+    Write-Host ("[dbg] ring records: " + [HttpIpc]::DbgSummary($false)) -ForegroundColor DarkGray
   }
   if ($owned) { try { $mutex.ReleaseMutex() } catch {} }
   Write-Host ''
-  Write-Host "[done] $($script:txn) transaction(s) shown" -ForegroundColor White
+  Write-Host "[done] $([HttpIpc]::Created()) transaction(s) shown" -ForegroundColor White
 }
