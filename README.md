@@ -145,7 +145,8 @@ Then point any number of agents at it (continuously / at boot, if you like):
 `GET /api/agent/<id>?limit=N` for the newest page, `?before=<pk>` for older pages,
 or `?since=<pk>` for the live tail; `GET /api/txn/<pk>?agent=<id>` for one
 transaction with full headers and bodies; `POST /api/agent` (register),
-`POST /api/ingest` (upload batch), and `GET /fav?h=<host>` (favicon proxy).
+`POST /api/ingest` (NDJSON upload batches; plain JSON still accepted), and
+`GET /fav?h=<host>` (favicon proxy).
 
 ## Architecture
 
@@ -405,6 +406,14 @@ to a dedicated uploader thread. The capture loop never waits on the network. The
 upload queue holds at most 256 batches; if the collector or tunnel falls behind,
 the oldest batch is dropped so memory stays flat instead of growing with the
 backlog. Each POST has a 30 second timeout and one retry.
+
+When more than one batch is queued (the normal case under load), the uploader
+drains up to 128 of them or 8 MB and sends them as a single
+`application/x-ndjson` POST, one complete JSON object per line. The number of
+POSTs then tracks network round trips rather than capture rate, so a slow tunnel
+produces fewer, larger uploads instead of a queue that keeps growing. The
+collector parses each line and applies the whole set in one SQLite transaction,
+trimming each affected agent to its newest 20,000 rows once per upload.
 
 Uploads over HTTPS cross the capture engine's own man-in-the-middle, because the
 engine intercepts every outbound 443 connection including this one. The uploader

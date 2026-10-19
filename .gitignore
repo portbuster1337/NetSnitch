@@ -3,3 +3,5 @@ cap.out
 captures.db
 captures.db-shm
 captures.db-wal
+__pycache__/
+*.pyc

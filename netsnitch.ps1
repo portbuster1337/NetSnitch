@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.22'
+$NetSnitchBuild = '2026.10.20.23'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -762,6 +762,13 @@ public static class HttpIpc
     // failing the whole run. The ServicePointManager tweaks (Expect100 off, accept
     // the MITM leaf cert, TLS1.2/1.3, no proxy) are process-global, so they already
     // apply to the requests created here.
+    //
+    // Coalescing: the capture loop can enqueue far faster than one POST crosses
+    // the MITM and tunnel, so the queue would otherwise drain at one small batch
+    // per round trip and back up until it starts dropping. Each upload body is a
+    // complete JSON object, so a drained run of them can be joined with newlines
+    // and sent as one application/x-ndjson POST. The collector parses each line
+    // and ingests the whole set in one SQLite transaction.
     static string _upUrl = "", _upMark = "";
     static int _upTimeoutMs = 30000;
     static volatile bool _upRun;
@@ -796,12 +803,29 @@ public static class HttpIpc
                 byte[] body;
                 if (!_upQ.TryDequeue(out body)) { Thread.Sleep(20); continue; }
                 Interlocked.Decrement(ref _upPending);
+                int sent = 1;
+                System.IO.MemoryStream ms = new System.IO.MemoryStream();
+                ms.Write(body, 0, body.Length);
+                long total = body.Length;
+                // Take everything that is already waiting, up to a sane cap. The
+                // next POST starts as soon as this one finishes, so a sustained
+                // flood still drains without an unbounded body.
+                while (sent < 128 && total < 8L * 1024 * 1024) {
+                    byte[] more;
+                    if (!_upQ.TryDequeue(out more)) break;
+                    Interlocked.Decrement(ref _upPending);
+                    ms.WriteByte(10);                       // newline-delimited JSON
+                    ms.Write(more, 0, more.Length);
+                    total += more.Length + 1;
+                    sent++;
+                }
+                byte[] outBody = ms.ToArray();
                 bool ok = false; string err = "";
                 for (int attempt = 0; attempt < 2 && !ok; attempt++) {
-                    try { PostOnce(_upUrl, body); ok = true; }
+                    try { PostOnce(_upUrl, outBody); ok = true; }
                     catch (Exception ex) { err = Flatten(ex); if (attempt == 0) Thread.Sleep(500); }
                 }
-                if (ok) { Interlocked.Increment(ref _upOk); _upFailing = false; }
+                if (ok) { Interlocked.Add(ref _upOk, sent); _upFailing = false; }
                 else { _upLastErr = err; _upFailing = true; }
             }
         });
@@ -824,7 +848,9 @@ public static class HttpIpc
     static void PostOnce(string url, byte[] bytes) {
         System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
         req.Method = "POST";
-        req.ContentType = "application/json; charset=utf-8";
+        // One JSON object per line. A single queued batch is also valid NDJSON, so
+        // this format works whether coalescing merged one body or many.
+        req.ContentType = "application/x-ndjson; charset=utf-8";
         req.KeepAlive = false;
         req.ProtocolVersion = System.Net.HttpVersion.Version11;
         try { req.ServicePoint.Expect100Continue = false; } catch { }

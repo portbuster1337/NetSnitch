@@ -57,6 +57,13 @@ def db_init(path):
     global DB
     DB = sqlite3.connect(path, check_same_thread=False)
     DB.execute("PRAGMA journal_mode=WAL")
+    # WAL plus NORMAL is the standard high-write combination: durable across a
+    # process crash, and far cheaper than a fsync for every upload batch. The
+    # collector is a capture cache, not a ledger.
+    DB.execute("PRAGMA synchronous=NORMAL")
+    DB.execute("PRAGMA busy_timeout=5000")
+    DB.execute("PRAGMA cache_size=-20000")
+    DB.execute("PRAGMA temp_store=MEMORY")
     DB.execute("""CREATE TABLE IF NOT EXISTS agents(
         id TEXT PRIMARY KEY, name TEXT, machine TEXT,
         first INTEGER, last INTEGER, count INTEGER DEFAULT 0)""")
@@ -89,41 +96,88 @@ def derive_host(d):
     return host
 
 
+def _upsert_agent_locked(aid, name, machine, now):
+    row = DB.execute("SELECT id FROM agents WHERE id=?", (aid,)).fetchone()
+    if row is None:
+        DB.execute("INSERT INTO agents(id,name,machine,first,last,count) VALUES(?,?,?,?,?,0)",
+                   (aid, name or aid, machine, now, now))
+    else:
+        DB.execute("UPDATE agents SET last=?, name=CASE WHEN ?<>'' THEN ? ELSE name END, "
+                   "machine=CASE WHEN ?<>'' THEN ? ELSE machine END WHERE id=?",
+                   (now, name, name, machine, machine, aid))
+
+
 def register(d):
     aid = str(d.get("agentId") or "unknown")
     name = d.get("agentName") or aid
     machine = d.get("machine") or ""
     now = now_ms()
     with DBLOCK:
-        row = DB.execute("SELECT id FROM agents WHERE id=?", (aid,)).fetchone()
-        if row is None:
-            DB.execute("INSERT INTO agents(id,name,machine,first,last,count) VALUES(?,?,?,?,?,0)",
-                       (aid, name, machine, now, now))
+        try:
+            _upsert_agent_locked(aid, name, machine, now)
+            DB.commit()
+        except Exception:
+            DB.rollback()
+            raise
+
+
+# One upload batch is one SQLite transaction. Previously every item performed its
+# own register/insert/count/trim/commit, which means a batch of 50 captures did 50
+# commits and 50 scans of the agent's newest 20k rows. Under a burst that serialized
+# the whole collector. Now the batch registers each agent once, inserts with
+# executemany, updates counts in one pass, and trims each affected agent once.
+def ingest_many(items):
+    rows = []
+    meta = {}                    # agent id -> [name, machine]
+    now = now_ms()
+    for d in items:
+        if not isinstance(d, dict):
+            continue
+        aid = str(d.get("agentId") or "unknown")
+        name = str(d.get("agentName") or "")
+        machine = str(d.get("machine") or "")
+        m = meta.get(aid)
+        if m is None:
+            meta[aid] = [name, machine]
         else:
-            DB.execute("UPDATE agents SET last=?, name=CASE WHEN ?<>'' THEN ? ELSE name END, "
-                       "machine=CASE WHEN ?<>'' THEN ? ELSE machine END WHERE id=?",
-                       (now, name, name, machine, machine, aid))
-        DB.commit()
+            if name:
+                m[0] = name
+            if machine:
+                m[1] = machine
+        rows.append((aid, d.get("ts") or now, d.get("method") or "", d.get("url") or "",
+                     derive_host(d), d.get("status") or "", d.get("process") or "",
+                     d.get("user") or "", d.get("requestHeaders") or "",
+                     d.get("requestBody") or "", d.get("responseHeaders") or "",
+                     d.get("responseBody") or ""))
+    if not rows:
+        return
+    counts = {}
+    for r in rows:
+        counts[r[0]] = counts.get(r[0], 0) + 1
+    with DBLOCK:
+        try:
+            for aid, m in meta.items():
+                _upsert_agent_locked(aid, m[0], m[1], now)
+            DB.executemany("""INSERT INTO txns(agent_id,ts,method,url,host,status,process,user,
+                                req_headers,req_body,res_headers,res_body)
+                              VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+            for aid, n in counts.items():
+                DB.execute("UPDATE agents SET count=count+?, last=? WHERE id=?", (n, now, aid))
+                # Keep the newest MAX_PER_AGENT rows. OFFSET is the pk of the first
+                # row that falls outside the window; NULL (too few rows) deletes
+                # nothing. Indexed by (agent_id, pk), and now runs once per batch.
+                DB.execute("""DELETE FROM txns WHERE agent_id=? AND pk <=
+                                (SELECT pk FROM txns WHERE agent_id=?
+                                 ORDER BY pk DESC LIMIT 1 OFFSET ?)""",
+                           (aid, aid, MAX_PER_AGENT))
+            DB.commit()
+        except Exception:
+            DB.rollback()
+            raise
 
 
 def ingest(d):
-    aid = str(d.get("agentId") or "unknown")
-    register(d)
-    host = derive_host(d)
-    now = now_ms()
-    with DBLOCK:
-        DB.execute("""INSERT INTO txns(agent_id,ts,method,url,host,status,process,user,
-                        req_headers,req_body,res_headers,res_body)
-                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                   (aid, d.get("ts") or now, d.get("method") or "", d.get("url") or "", host,
-                    d.get("status") or "", d.get("process") or "", d.get("user") or "",
-                    d.get("requestHeaders") or "", d.get("requestBody") or "",
-                    d.get("responseHeaders") or "", d.get("responseBody") or ""))
-        DB.execute("UPDATE agents SET count=count+1, last=? WHERE id=?", (now, aid))
-        DB.execute("""DELETE FROM txns WHERE agent_id=? AND pk NOT IN
-                        (SELECT pk FROM txns WHERE agent_id=? ORDER BY pk DESC LIMIT ?)""",
-                   (aid, aid, MAX_PER_AGENT))
-        DB.commit()
+    ingest_many([d])
 
 
 def get_agents():
@@ -650,33 +704,54 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._redirect("/login?e=1")
             return
-        # agent push endpoints are open
+        # Agent push endpoints are open. The uploader sends NDJSON: one complete
+        # batch object per line, so it can merge many queued batches into one POST.
+        # A single batch is also valid NDJSON; plain JSON is still accepted for
+        # older agents and manual posts.
+        ctype = (self.headers.get("Content-Type") or "").lower()
         try:
             # Tolerant on purpose: PowerShell 5.1 clients can emit control
             # characters inside JSON strings and/or non-UTF-8 byte sequences
             # when a captured body is binary. Rejecting the whole batch loses
             # the text records that rode along with it.
-            d = json.loads(raw.decode("utf-8", "replace"), strict=False) if raw else {}
+            if raw and "ndjson" in ctype:
+                docs = [json.loads(line.decode("utf-8", "replace"), strict=False)
+                        for line in raw.splitlines() if line.strip()]
+            else:
+                try:
+                    docs = [json.loads(raw.decode("utf-8", "replace"), strict=False)] if raw else []
+                except Exception:
+                    # An intermediary can rewrite Content-Type while leaving the
+                    # newline-delimited body intact. Accept that shape too.
+                    if raw and b"\n" in raw.strip():
+                        docs = [json.loads(line.decode("utf-8", "replace"), strict=False)
+                                for line in raw.splitlines() if line.strip()]
+                    else:
+                        raise
         except Exception as e:
             self._send(400, json.dumps({"error": "bad json: %s" % e}))
             return
         if path == "/api/ingest":
             try:
-                if isinstance(d, dict) and "items" in d:
-                    aid = d.get("agentId"); aname = d.get("agentName"); machine = d.get("machine")
-                    for it in d["items"]:
-                        if aid and not it.get("agentId"): it["agentId"] = aid
-                        if aname and not it.get("agentName"): it["agentName"] = aname
-                        if machine and not it.get("machine"): it["machine"] = machine
-                        ingest(it)
-                else:
-                    for x in (d if isinstance(d, list) else [d]):
-                        ingest(x)
-                self._send(200, json.dumps({"ok": True}))
+                for d in docs:
+                    if isinstance(d, dict) and isinstance(d.get("items"), list):
+                        aid = d.get("agentId"); aname = d.get("agentName"); machine = d.get("machine")
+                        for it in d["items"]:
+                            if not isinstance(it, dict):
+                                continue
+                            if aid and not it.get("agentId"): it["agentId"] = aid
+                            if aname and not it.get("agentName"): it["agentName"] = aname
+                            if machine and not it.get("machine"): it["machine"] = machine
+                        ingest_many(d["items"])
+                    elif isinstance(d, list):
+                        ingest_many(d)
+                    else:
+                        ingest_many([d])
+                self._send(200, json.dumps({"ok": True, "batches": len(docs)}))
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}))
         elif path == "/api/agent":
-            register(d)
+            register(docs[0] if docs and isinstance(docs[0], dict) else {})
             self._send(200, json.dumps({"ok": True}))
         else:
             self._send(404, json.dumps({"error": "not found"}))
