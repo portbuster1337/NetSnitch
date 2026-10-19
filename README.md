@@ -76,9 +76,13 @@ Run from an elevated prompt (or let it elevate itself):
 
 `-Background` and `-Persistence` are built to be safe to leave running:
 
-- **Runs at below-normal priority** (the process, the scan thread, and the HTTP
-  service while armed) so capture can never starve the OS, SSH, or other
-  services - the machine stays responsive even under a heavy traffic storm.
+- **Leaves the capture service at normal priority and runs the reader at normal
+  too**, so the slot-freeing pump keeps pace with the network data path; the
+  uploader thread alone runs below-normal. The pump sleeps on the service's
+  `_evt_filled` event, so it costs about 0% CPU when traffic is quiet.
+- **Bounded buffers end to end.** The transaction ring is drained as it fills, and
+  the collector upload queue is capped (the oldest batch is dropped) so a slow
+  tunnel cannot grow memory without limit.
 - **Arms the capture exactly once per boot.** Re-arming an already-armed service
   breaks external traffic, so any second run this boot (or the boot task itself)
   attaches read-only instead of re-arming.
@@ -127,17 +131,21 @@ Then point any number of agents at it (continuously / at boot, if you like):
   so agents don't need the password.
 - **Stable agent id.** Each machine is identified by a hash of its MachineGuid +
   SMBIOS UUID, so re-runs/reboots never create duplicate agents.
-- **Web UI.** The home page lists agents; click one to see its captures. Each entry
-  shows the site's **favicon** (fetched + cached server-side), method, URL, status,
-  process and time, and expands to the full request/response headers and bodies.
-  The view refreshes incrementally (preserves scroll and open rows).
+- **Paged web UI.** The home page lists agents; click one to see its captures. The
+  list loads only the newest 60 rows, and each row carries lightweight metadata
+  (method, URL, status, process, time, body size) rather than full headers and
+  bodies. Expanding a row fetches that one transaction's detail on demand.
+  Scrolling down loads older pages; the top polls for new rows every 3 s and can
+  be paused. Scroll position and open rows survive the updates.
 - **Clean data.** Only complete request+response pairs are shown; the agent's own
   uploads and one-sided/orphan records are filtered out.
 
 **HTTP endpoints** (for reference): `GET /` and `/agent/<id>` (UI), `GET /login`
-`/logout`, `POST /login`; JSON API `GET /api/agents`, `GET /api/agent/<id>?since=<ts>`,
-`POST /api/agent` (register), `POST /api/ingest` (upload batch), and `GET /fav?h=<host>`
-(favicon proxy).
+`/logout`, `POST /login`; JSON API `GET /api/agents`;
+`GET /api/agent/<id>?limit=N` for the newest page, `?before=<pk>` for older pages,
+or `?since=<pk>` for the live tail; `GET /api/txn/<pk>?agent=<id>` for one
+transaction with full headers and bodies; `POST /api/agent` (register),
+`POST /api/ingest` (upload batch), and `GET /fav?h=<host>` (favicon proxy).
 
 ## Architecture
 
@@ -151,9 +159,9 @@ file-mapping calls via P/Invoke.
 ```mermaid
 flowchart LR
     subgraph agent["netsnitch.ps1 (admin)"]
-        arm["arm: hold mutex +<br/>push selectors 4,9,11,2"]
-        pump["snapshot pump<br/>native thread, ~1 kHz"]
-        dec["decode: fields by u32 len,<br/>group by id, inflate bodies"]
+        arm["arm: hold mutex + push rules<br/>profile, then selectors 3,9,11,2"]
+        pump["slot pump<br/>wakes on _evt_filled,<br/>frees ready slots 2 -> 0"]
+        dec["native parse: fields by u32 len,<br/>group by id, settle, inflate"]
     end
 
     subgraph ipc["Global#92; shared memory (file mappings)"]
@@ -174,15 +182,15 @@ flowchart LR
     arm -- "write record + SetEvent(_evt_filled)" --> cmd
     cmd --> engine
     mutex -. "UI-present gate" .-> engine
-    arm == "selector 4 installs CA" ==> root
+    arm == "selector 3 installs CA" ==> root
     root -. "leaf chains to a trusted root,<br/>so the client accepts it" .-> app
     app == "TLS" ==> mitm --> engine
     engine == "decrypted req/resp,<br/>length-prefixed records" ==> txn
-    txn -- "re-scan slots, dedup by content sig" --> pump --> dec
-    dec -. "-Server: JSON over HTTP" .-> server[("server.py<br/>SQLite + web UI")]
+    txn -- "rescan, dedup by content sig,<br/>free each ready slot" --> pump --> dec
+    dec -. "-Server: batch JSON,<br/>background uploader" .-> server[("server.py<br/>SQLite + paged web UI")]
 ```
 
-The whole reason HTTPS comes out in the clear: **selector 4 installs the CA into the
+The whole reason HTTPS comes out in the clear: **selector 3 installs the CA into the
 system trust store first**, so when the service's man-in-the-middle presents a leaf
 certificate signed by that CA, the client's normal certificate validation succeeds
 and it hands over plaintext. The ordered handshake and TLS interception look like
@@ -197,9 +205,11 @@ sequenceDiagram
     participant R as System Root store
     participant C as app (TLS client)
     participant T as HttpTransaction ring
+    participant K as server.py (collector)
 
     S->>M: WaitOne() (pose as the UI)
-    S->>E: selector 4 (install CA)
+    S->>E: push rules profile over IpcSettings
+    S->>E: selector 3 (install CA)
     E->>R: add "HTTP DEBUGGER CA for DEBUG ONLY"
     S->>E: selectors 9, 11 (build + apply 80/443 rules)
     S->>E: selector 2 (user handshake)
@@ -210,9 +220,11 @@ sequenceDiagram
     C->>E: encrypted request
     E->>E: decrypt, relay to origin, re-encrypt the response
     E->>T: write plaintext req/resp records
-    loop every ~1 ms
-        S->>T: re-scan slots, pull changed records
+    loop on _evt_filled (15 ms timeout when idle)
+        S->>T: rescan slots, pull changed records
+        S->>T: free ready slots (state 2 -> 0)
     end
+    S-->>K: batch upload on the background thread
 ```
 
 ### 1. IPC surface
@@ -246,10 +258,22 @@ static IntPtr Map(string name, UIntPtr bytes, uint access) {
 
 ### 2. Ring + record layout
 
-The `_mem` header is a struct of `uint`s: `capacity@0x00`, `writeCursor@0x04`,
-`readCursor@0x08`, `stride@0x18` (always `0x6000`), `total@0x1C` (= capacity x
-stride). The `_data` region is `capacity` fixed `0x6000`-byte **slots**. Every slot
-begins with a 16-byte **chunk header**, then a payload:
+The `_mem` header is a struct of `uint`s: `capacity@0x00` (also mirrored at
+`@0x14`), `writeCursor@0x04`, `readCursor@0x08`, `stride@0x18` (always `0x6000`),
+`total@0x1C` (= capacity x stride). The cursors are **wrapping slot indices** in
+`[0, capacity)`, not byte offsets.
+
+The `_data` region is `capacity` fixed `0x6000`-byte **slots**, immediately followed
+by a **slot-state array** of `capacity` 4-byte words (so the mapping is
+`total + capacity*4` bytes). The state word for slot `i` lives at `total + i*4` and
+drives a lock-free producer/consumer handshake:
+
+```
+state:  0 = free        1 = producer writing
+        2 = ready       (consumer reads, then writes 0 to free the slot)
+```
+
+Every slot begins with a 16-byte **chunk header**, then a payload:
 
 ```
 slot:  +0x00 magic/state words   +0x0C D = payload size (EXCLUDES the 16-byte header)
@@ -259,15 +283,26 @@ tag =  0 request, 1 request body, 2 response, 3 response body
 ```
 
 A full transaction is several records sharing one `id@0x14`; the record's real end
-is `D + 16`.
+is `D + 16`. HTTP/2 requests (most HTTPS today) are bridged to HTTP/1 by the engine
+and carry `x-exhdr-method` / `x-exhdr-path` / `x-exhdr-authority` / `x-exhdr-streamid`
+pseudo-headers; the decoder reconstructs the request line and URL from those.
 
 ### 3. Arming headlessly
 
-Capture needs **both** the mutex held *and* the GUI's startup command sequence,
-selectors **4, 9, 11, 2** (install CA, build 80/443 rules, apply, user
-handshake). Each command is one record written into the EngineCommand ring: fill
-the chunk header, put the selector at `+0x10`, flip the slot's state word to
-`READY`, bump `writeCursor`, and pulse the "filled" event so the service wakes:
+Capture needs the mutex held, the GUI's **rules profile pushed into the live
+engine**, *and* its startup command sequence, selectors **3, 9, 11, 2** (install
+CA, build 80/443 rules, apply, user handshake).
+
+The rules profile is not loaded from `settings.xml` on disk - writing that file is
+only persistence. The engine's active profile is set **only** when the XML document
+is pushed over the `Global\HttpDebuggerIpcSettings` channel (the UI does this at
+startup). Without it the engine has no profile, selector 11 (apply) is a no-op, and
+HTTPS is never decrypted. So NetSnitch both writes the file (for parity) and pushes
+it over IPC during arming.
+
+Each command is one record written into the EngineCommand ring: fill the chunk
+header, put the selector at `+0x10`, flip the slot's state word to `READY`, bump
+`writeCursor`, and pulse the "filled" event so the service wakes:
 
 ```csharp
 BitConverter.GetBytes(selector).CopyTo(rec, 16);           // selector at +0x10
@@ -281,52 +316,78 @@ SetEvent(OpenEventA(EVENT_ALL, false, b + "_evt_filled")); // service processes 
 # the script holds the mutex (poses as the UI) around the whole arm
 $mutex = [System.Threading.Mutex]::OpenExisting('Global\HttpDebuggerUiStarted')
 $owned = $mutex.WaitOne(3000)
-[HttpIpc]::ArmCapture($env:USERNAME)   # pushes selectors 4,9,11,2 with short settles
+[HttpIpc]::ArmCapture($env:USERNAME, $settingsXml)  # push profile, then selectors 3,9,11,2
 ```
 
 Neither the mutex nor the commands alone start capture; together they do.
 
-**What each selector does** (and why the order is 4, 9, 11, 2):
+**What each selector does** (and why the order is 3, 9, 11, 2):
 
 | Selector | Step | Effect |
 |---|---|---|
-| **4** | install CA | Adds `HTTP DEBUGGER CA for DEBUG ONLY` to `LocalMachine\Root`. Runs **first** so the MITM's leaf certificates are already trusted before any 443 traffic is intercepted; this is what makes HTTPS come out decrypted. |
-| **9** | build rules | Compiles the capture ruleset for ports 80 and 443 (from `settings.xml`) and loads it into the engine. |
-| **11** | apply rules | Activates the built rules, so the NetFilter driver starts redirecting matching TCP flows through the engine. |
+| **3** | install CA | Cleans up any old cert, reimports and verifies `HTTP DEBUGGER CA for DEBUG ONLY` into `LocalMachine\Root`, and sets the engine's SSL-ready flag. Runs **first** so the MITM's leaf certificates are already trusted before any 443 traffic is intercepted; this is what makes HTTPS come out decrypted. (The UI uses selector 3 here, never 4.) |
+| **9** | build rules | Adds the NetFilter driver rules for ports 80 (`0x0050`) and 443 (`0x01bb`), so matching TCP flows are redirected through the engine. |
+| **11** | apply rules | Activates the pushed rules profile. This step is gated on the profile having been set over `IpcSettings` first. |
 | **2** | user handshake | Sends the current username, completing the startup handshake the engine expects from the UI before it will publish transactions. |
 
-The ordering is load-bearing: the CA must be trusted **before** 443 is tapped (4
+The ordering is load-bearing: the CA must be trusted **before** 443 is tapped (3
 before 9/11), rules must be built before they can be applied (9 before 11), and the
 engine only begins emitting records after the user handshake (2 last).
 
-### 4. Reading: the snapshot pump
+### 4. Reading: the snapshot pump (and freeing slots)
 
 The naive reader (follow `writeCursor` and read each new slot once) **misses most
-requests**. The service writes a request record, then *clears that slot* shortly
-after it pairs the request with its response internally; a cursor reader that reads
-each slot a single time loses the race and is left with response-only orphans.
+requests**. The service writes a request record, then reuses that slot shortly after
+it pairs the request with its response internally; a cursor reader that reads each
+slot a single time loses the race and is left with response-only orphans.
 
 The fix is to stop chasing the cursor and instead **continuously re-scan every
 slot**, emitting a slot's record whenever its content *changes* (deduped by a cheap
-content signature). That reliably catches the short-lived request records. It runs
-on a native background thread so it doesn't block the PowerShell pipeline, sleeps
-1 ms between passes, and runs below-normal priority (about 0.2% of one core), versus
-a no-sleep loop that would pin a whole core:
+content signature). That reliably catches the short-lived request records.
+
+**Freeing slots is not optional - it is what keeps capture from throttling the
+machine's real traffic.** The transaction ring is a semaphore-gated bounded queue:
+when the service wants to write a record and the target slot is not `free` (state
+`0`), its producer **blocks for up to 500 ms (`0x1f4`) per record**, then drops it.
+Since the service sits in the network data path (it MITMs every connection), a ring
+that never drains makes the producer stall on every write once it is full - which is
+exactly why browsing crawled under an early version of the capture but was fast under
+the stock UI. The UI's consumer frees each slot after reading it; so does NetSnitch,
+matching its exact sequence: claim the ready slot, then **write `0` to the slot's
+state word** (`total + i*4`) to return it to the producer, advance `readCursor`, and
+pulse `_evt_avai` to wake a producer parked on it.
+
+The pump also **waits on the service's `_evt_filled` event** (what the UI waits on)
+instead of busy-polling, so it wakes the instant a record is published and sits at
+~0% CPU when idle. It runs at **normal** priority - the same class as the service -
+so freeing keeps pace with producing; running it below-normal let it fall behind and
+reintroduced the 500 ms stalls. Crucially, the service priority is **left alone**:
+dropping the process that forwards every packet would itself slow browsing.
 
 ```csharp
 while (_pumpRun) {
+    long total = (long)cap * stride;
     for (int slot = 0; slot < cap; slot++) {
-        uint D = RU(data, off + 12); if (D < 16) continue;             // empty slot
-        uint sig = D ^ tag*2654435761u ^ id*40503u ^ ...;              // content signature
-        if (_slotSig[slot] == sig) continue;                           // unchanged, skip
-        _slotSig[slot] = sig;
-        _pumpQ.Enqueue(CopyRecord(off, D));                            // new record, queue
+        uint D = RU(data, off + 12);
+        if (D >= 16) {                                                 // non-empty slot
+            uint sig = D ^ tag*2654435761u ^ id*40503u ^ ...;          // content signature
+            if (_slotSig[slot] != sig) {                               // changed -> capture
+                _slotSig[slot] = sig;
+                _pumpQ.Enqueue(CopyRecord(off, D));
+            }
+        }
+        long s = total + (long)slot * 4;                              // slot-state word
+        if (Marshal.ReadInt32(data, (int)s) == 2)                     // ready, captured ->
+            Marshal.WriteInt32(data, (int)s, 0);                      //   free it (2 -> 0)
     }
-    Thread.Sleep(1);                                                   // ~1 kHz, tiny CPU
+    AdvanceReadCursor(); SetEvent(_evtAvai);                           // match the UI consumer
+    WaitForSingleObject(_evtFilled, 15);                              // wake on new data, ~0% idle
 }
 ```
 
-PowerShell drains the queue, groups records by `id@0x14`, and decodes each one.
+PowerShell drains the queue, groups records by `id@0x14`, and decodes each one. All
+of that parse/group/settle work also runs in native code, so the pipeline only
+filters, prints, and uploads finished transactions.
 
 ### 5. Decoding a record
 
@@ -336,6 +397,28 @@ field extraction scans for a `u32`-length-prefixed run that is NUL-free and at l
 80% printable, which isolates each field exactly, with no merges or trailing junk.
 Body records (tags 1/3) are pulled as **raw** bytes (no printable filter) so binary
 payloads survive, then gzip/deflate is inflated by magic bytes.
+
+### 6. Streaming to the collector
+
+With `-Server`, finished transactions are serialized into a JSON batch and handed
+to a dedicated uploader thread. The capture loop never waits on the network. The
+upload queue holds at most 256 batches; if the collector or tunnel falls behind,
+the oldest batch is dropped so memory stays flat instead of growing with the
+backlog. Each POST has a 30 second timeout and one retry.
+
+Uploads over HTTPS cross the capture engine's own man-in-the-middle, because the
+engine intercepts every outbound 443 connection including this one. The uploader
+therefore accepts the MITM leaf certificate, disables `Expect: 100-continue`,
+allows TLS 1.2/1.3, and bypasses any system proxy. The certificate callback is a
+**native delegate**, not a PowerShell `ScriptBlock`: a scriptblock callback needs a
+runspace, and the background uploader thread does not own one, so TLS validation
+would fail silently on that thread even though the main thread's registration POST
+succeeded. A native delegate has no runspace requirement.
+
+Transactions whose host is the collector itself are filtered out, so a captured
+upload is never sent back to the collector in an endless feedback loop. On the
+receiving side, `/api/ingest` reads both `Content-Length` and chunked bodies, since
+the capture MITM and a tunnel can reframe the request on the way.
 
 ## Output
 

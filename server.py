@@ -134,26 +134,60 @@ def get_agents():
              "last": r[4], "count": r[5]} for r in rows]
 
 
-def get_agent(aid, since):
+def agent_meta(aid):
     with DBLOCK:
         a = DB.execute("SELECT id,name,machine,first,last,count FROM agents WHERE id=?",
                        (aid,)).fetchone()
-        if not a:
-            return None
-        cols = ("pk,ts,method,url,host,status,process,user,"
-                "req_headers,req_body,res_headers,res_body")
+    if not a:
+        return None
+    return {"id": a[0], "name": a[1], "machine": a[2], "first": a[3], "last": a[4], "count": a[5]}
+
+
+# Metadata-only columns for the list: never ship the (potentially huge) headers and
+# bodies with the list itself - only their byte sizes, so the grid stays light no
+# matter how many HTTP/HTTPS transactions pile up. The full detail is fetched per row
+# on expand via get_txn_full().
+_LIST_COLS = ("pk,ts,method,url,host,status,process,user,"
+              "length(req_headers),length(req_body),length(res_headers),length(res_body)")
+
+
+def _list_row(r):
+    return {"id": r[0], "ts": r[1], "method": r[2], "url": r[3], "host": r[4],
+            "status": r[5], "process": r[6], "user": r[7],
+            "reqHeadersLen": r[8] or 0, "reqBodyLen": r[9] or 0,
+            "resHeadersLen": r[10] or 0, "resBodyLen": r[11] or 0}
+
+
+def list_txns(aid, since, before, limit):
+    """Paginated, metadata-only listing.
+      since>0  -> new rows with pk>since, ascending (live tail)
+      before>0 -> older page with pk<before, descending (scroll back)
+      neither  -> newest page, descending
+    """
+    limit = max(1, min(int(limit or 60), 500))
+    with DBLOCK:
         if since > 0:
-            rows = DB.execute("SELECT %s FROM txns WHERE agent_id=? AND pk>? ORDER BY pk ASC"
-                              % cols, (aid, since)).fetchall()
+            rows = DB.execute("SELECT %s FROM txns WHERE agent_id=? AND pk>? ORDER BY pk ASC LIMIT ?"
+                              % _LIST_COLS, (aid, since, limit)).fetchall()
+        elif before > 0:
+            rows = DB.execute("SELECT %s FROM txns WHERE agent_id=? AND pk<? ORDER BY pk DESC LIMIT ?"
+                              % _LIST_COLS, (aid, before, limit)).fetchall()
         else:
-            rows = DB.execute("SELECT %s FROM txns WHERE agent_id=? ORDER BY pk DESC LIMIT 2000"
-                              % cols, (aid,)).fetchall()
-            rows = list(reversed(rows))
-    txns = [{"id": r[0], "ts": r[1], "method": r[2], "url": r[3], "host": r[4],
-             "status": r[5], "process": r[6], "user": r[7], "reqHeaders": r[8],
-             "reqBody": r[9], "resHeaders": r[10], "resBody": r[11]} for r in rows]
-    agent = {"id": a[0], "name": a[1], "machine": a[2], "first": a[3], "last": a[4], "count": a[5]}
-    return {"agent": agent, "transactions": txns}
+            rows = DB.execute("SELECT %s FROM txns WHERE agent_id=? ORDER BY pk DESC LIMIT ?"
+                              % _LIST_COLS, (aid, limit)).fetchall()
+    return [_list_row(r) for r in rows]
+
+
+def get_txn_full(aid, pk):
+    with DBLOCK:
+        r = DB.execute("SELECT pk,ts,method,url,host,status,process,user,"
+                       "req_headers,req_body,res_headers,res_body "
+                       "FROM txns WHERE agent_id=? AND pk=?", (aid, pk)).fetchone()
+    if not r:
+        return None
+    return {"id": r[0], "ts": r[1], "method": r[2], "url": r[3], "host": r[4],
+            "status": r[5], "process": r[6], "user": r[7], "reqHeaders": r[8],
+            "reqBody": r[9], "resHeaders": r[10], "resBody": r[11]}
 
 
 _ICON_RE = re.compile(r'<link[^>]+rel=["\']?[^"\'>]*icon[^"\'>]*["\']?[^>]*>', re.I)
@@ -335,68 +369,115 @@ load();setInterval(load,3000);
 
 AGENT_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NetSnitch - agent</title><style>__CSS__</style></head><body>
+<title>NetSnitch - agent</title><style>__CSS__
+.when{width:70px}.size{color:var(--mut);font-size:12px;white-space:nowrap;width:70px;text-align:right}
+#more{padding:14px;text-align:center;color:var(--mut);font-size:12px}
+.pausebtn{margin-left:10px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 12px;cursor:pointer;font-size:12px}
+</style></head><body>
 <header><a href="/">&larr;</a><h1 id="aname">agent</h1>
 <span class="sub" id="ameta"></span>
 <span class="right"><a href="/logout">sign out</a></span></header>
 <div class="wrap">
-<div class="toolbar"><input class="search" id="q" placeholder="filter by url, method, status, process...">
+<div class="toolbar"><input class="search" id="q" placeholder="filter loaded rows by url, method, status, process...">
+<button class="pausebtn" id="pause">pause live</button>
 <span class="sub" id="count"></span></div>
-<div id="list"></div><div id="empty" class="empty" style="display:none">No captures yet.</div></div>
+<div id="list"></div>
+<div id="more"></div>
+<div id="empty" class="empty" style="display:none">No captures yet.</div></div>
 <script>
 var AID=decodeURIComponent(location.pathname.split('/agent/')[1]||'');
-var maxPk=0;
+var newestPk=0, oldestPk=0, loadingOlder=false, noMore=false, live=true, total=0;
 function ago(ms){var s=(Date.now()-ms)/1000;if(s<60)return Math.floor(s)+'s ago';
 if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
 function sclass(st){var n=parseInt(st,10)||0;return n>=500?'s5':n>=400?'s4':n>=300?'s3':n>=200?'s2':'';}
-function mkSec(cls,title,txt){if(!txt)return null;var d=document.createElement('div');d.className='sec '+cls;
+function fmtSize(n){if(!n)return '';if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(1)+' MB';}
+function mkSec(cls,title,txt){if(txt===null||txt===undefined||txt==='')return null;var d=document.createElement('div');d.className='sec '+cls;
  var h=document.createElement('h4');h.textContent=title;var p=document.createElement('pre');p.textContent=txt;
  d.appendChild(h);d.appendChild(p);return d;}
+function setMeta(a){document.getElementById('aname').textContent=a.name;
+ document.getElementById('ameta').textContent=(a.machine||a.id)+' - '+a.count+' total captures';}
 function mkRow(t){
- var row=document.createElement('div');row.className='row';
+ var row=document.createElement('div');row.className='row';row.dataset.pk=t.id;
  row.dataset.search=((t.method||'')+' '+(t.url||'')+' '+(t.status||'')+' '+(t.process||'')+' '+(t.host||'')).toLowerCase();
  var head=document.createElement('div');head.className='rhead';
  var img=document.createElement('img');img.className='fav';img.src='/fav?h='+encodeURIComponent(t.host||'');img.loading='lazy';
- var m=document.createElement('span');m.className='method m-'+(t.method||'');m.textContent=t.method||'\\u2014';
+ var m=document.createElement('span');m.className='method m-'+(t.method||'');m.textContent=t.method||'-';
  var u=document.createElement('span');u.className='url';u.textContent=t.url||t.host||'(no url)';u.title=t.url||t.host||'';
  var who=document.createElement('span');who.className='who';who.textContent=t.process||'';
+ var sz=document.createElement('span');sz.className='size';sz.textContent=fmtSize(t.resBodyLen||t.reqBodyLen||0);
  var st=document.createElement('span');st.className='status '+sclass(t.status);st.textContent=(t.status||'').split(' ')[0];
  var wh=document.createElement('span');wh.className='when';wh.dataset.ts=t.ts;wh.textContent=ago(t.ts);
- head.appendChild(img);head.appendChild(m);head.appendChild(u);head.appendChild(who);head.appendChild(st);head.appendChild(wh);
+ head.appendChild(img);head.appendChild(m);head.appendChild(u);head.appendChild(who);head.appendChild(sz);head.appendChild(st);head.appendChild(wh);
  var det=document.createElement('div');det.className='detail';
- [['req','request headers',t.reqHeaders],['req','request body',t.reqBody],
-  ['res','response headers',t.resHeaders],['res','response body',t.resBody]].forEach(function(s){
-   var e=mkSec(s[0],s[1],s[2]);if(e)det.appendChild(e);});
- if(!det.children.length){var e=document.createElement('div');e.className='sec';var p=document.createElement('pre');p.textContent='(no captured detail)';e.appendChild(p);det.appendChild(e);}
- head.onclick=function(){det.classList.toggle('open');};
+ var loaded=false;
+ head.onclick=function(){
+  det.classList.toggle('open');
+  if(det.classList.contains('open')&&!loaded){
+   loaded=true;det.innerHTML='<div class="sec"><pre>loading...</pre></div>';
+   fetch('/api/txn/'+t.id+'?agent='+encodeURIComponent(AID)).then(function(r){return r.json();}).then(function(d){
+    det.innerHTML='';
+    [['req','request headers',d.reqHeaders],['req','request body',d.reqBody],
+     ['res','response headers',d.resHeaders],['res','response body',d.resBody]].forEach(function(s){
+      var e=mkSec(s[0],s[1],s[2]);if(e)det.appendChild(e);});
+    if(!det.children.length){det.innerHTML='<div class="sec"><pre>(no captured detail)</pre></div>';}
+   }).catch(function(){det.innerHTML='<div class="sec"><pre>(failed to load)</pre></div>';loaded=false;});
+  }
+ };
  row.appendChild(head);row.appendChild(det);return row;
 }
 function applyFilter(){
  var q=document.getElementById('q').value.toLowerCase();var list=document.getElementById('list');
- var shown=0,total=list.children.length;
+ var shown=0;
  for(var i=0;i<list.children.length;i++){var r=list.children[i];
   var ok=!q||r.dataset.search.indexOf(q)>=0;r.style.display=ok?'':'none';if(ok)shown++;}
- document.getElementById('count').textContent=shown+(q?' / '+total:'')+' captures';
+ document.getElementById('count').textContent=shown+' shown | '+total+' loaded';
 }
-async function load(){
- try{var r=await fetch('/api/agent/'+encodeURIComponent(AID)+'?since='+maxPk);
+function updateTimes(){var w=document.querySelectorAll('.when');
+ for(var i=0;i<w.length;i++){if(w[i].dataset.ts)w[i].textContent=ago(+w[i].dataset.ts);}}
+var list=document.getElementById('list');
+async function loadNewest(){
+ try{var r=await fetch('/api/agent/'+encodeURIComponent(AID)+'?limit=60');
   if(r.status===401){location='/login';return;}var j=await r.json();}catch(e){return;}
  if(j.error){document.getElementById('aname').textContent='agent not found';return;}
- document.getElementById('aname').textContent=j.agent.name;
- document.getElementById('ameta').textContent=(j.agent.machine||j.agent.id)+' \\u2014 '+j.agent.count+' captures';
- var list=document.getElementById('list');
- if(j.transactions.length){
-  var atTop=window.scrollY<40;var before=document.body.scrollHeight;
-  j.transactions.forEach(function(t){if(t.id>maxPk)maxPk=t.id;list.insertBefore(mkRow(t),list.firstChild);});
-  applyFilter();
-  if(!atTop){window.scrollBy(0,document.body.scrollHeight-before);}
- }
- var w=document.querySelectorAll('.when');
- for(var i=0;i<w.length;i++){if(w[i].dataset.ts)w[i].textContent=ago(+w[i].dataset.ts);}
- document.getElementById('empty').style.display=list.children.length?'none':'block';
+ setMeta(j.agent);
+ j.items.forEach(function(t){if(t.id>newestPk)newestPk=t.id;if(!oldestPk||t.id<oldestPk)oldestPk=t.id;
+  list.appendChild(mkRow(t));total++;});
+ if(j.items.length<60)noMore=true;
+ document.getElementById('empty').style.display=total?'none':'block';
+ applyFilter();
 }
+async function loadOlder(){
+ if(loadingOlder||noMore||!oldestPk)return;loadingOlder=true;
+ document.getElementById('more').textContent='loading older...';
+ try{var r=await fetch('/api/agent/'+encodeURIComponent(AID)+'?before='+oldestPk+'&limit=60');
+  if(r.status===401){location='/login';return;}var j=await r.json();}catch(e){loadingOlder=false;document.getElementById('more').textContent='';return;}
+ if(!j.items.length){noMore=true;document.getElementById('more').textContent='- end -';loadingOlder=false;return;}
+ j.items.forEach(function(t){if(!oldestPk||t.id<oldestPk)oldestPk=t.id;list.appendChild(mkRow(t));total++;});
+ if(j.items.length<60)noMore=true;
+ document.getElementById('more').textContent=noMore?'- end -':'';
+ applyFilter();loadingOlder=false;
+}
+async function loadNew(){
+ if(!live||!newestPk)return;
+ try{var r=await fetch('/api/agent/'+encodeURIComponent(AID)+'?since='+newestPk+'&limit=300');
+  if(r.status===401){location='/login';return;}var j=await r.json();}catch(e){return;}
+ if(j.agent)setMeta(j.agent);
+ if(j.items.length){
+  var atTop=window.scrollY<60;var before=document.body.scrollHeight;
+  j.items.forEach(function(t){if(t.id>newestPk)newestPk=t.id;list.insertBefore(mkRow(t),list.firstChild);total++;});
+  applyFilter();
+  if(!atTop){window.scrollBy(0,document.body.scrollHeight-before);}  // keep scroll position when not at top
+ }
+ updateTimes();
+}
+// Infinite scroll: pull older pages as you near the bottom.
+window.addEventListener('scroll',function(){
+ if(window.innerHeight+window.scrollY>=document.body.scrollHeight-400){loadOlder();}
+});
 document.getElementById('q').addEventListener('input',applyFilter);
-load();setInterval(load,3000);
+document.getElementById('pause').addEventListener('click',function(){
+ live=!live;this.textContent=live?'pause live':'resume live';});
+loadNewest();setInterval(loadNew,3000);setInterval(updateTimes,15000);
 </script></body></html>"""
 
 
@@ -512,18 +593,39 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, AGENT_HTML.replace("__CSS__", PAGE_CSS), "text/html; charset=utf-8")
         elif path == "/api/agents":
             self._send(200, json.dumps(get_agents()))
+        elif path.startswith("/api/txn/"):
+            qs = parse_qs(urlparse(self.path).query)
+            aid = unquote((qs.get("agent") or [""])[0])
+            try:
+                pk = int(path[len("/api/txn/"):])
+            except Exception:
+                pk = 0
+            t = get_txn_full(aid, pk) if (aid and pk) else None
+            if t is None:
+                self._send(404, json.dumps({"error": "not found"}))
+            else:
+                self._send(200, json.dumps(t))
         elif path.startswith("/api/agent/"):
             aid = unquote(path[len("/api/agent/"):])
-            since = 0
-            try:
-                since = int((parse_qs(urlparse(self.path).query).get("since") or ["0"])[0])
-            except Exception:
-                since = 0
-            r = get_agent(aid, since)
-            if r is None:
+            qs = parse_qs(urlparse(self.path).query)
+
+            def _qint(k):
+                try:
+                    return int((qs.get(k) or ["0"])[0])
+                except Exception:
+                    return 0
+
+            meta = agent_meta(aid)
+            if meta is None:
                 self._send(404, json.dumps({"error": "no such agent"}))
             else:
-                self._send(200, json.dumps(r))
+                since = _qint("since")
+                before = _qint("before")
+                limit = _qint("limit")
+                items = list_txns(aid, since, before, limit)
+                self._send(200, json.dumps({
+                    "agent": meta, "items": items,
+                    "mode": "since" if since > 0 else "page"}))
         elif path == "/fav":
             host = (parse_qs(urlparse(self.path).query).get("h") or [""])[0].strip().lower()
             data, ctype = fetch_favicon(host)
