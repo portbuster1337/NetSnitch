@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.14'
+$NetSnitchBuild = '2026.10.20.15'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -1171,6 +1171,30 @@ function Expl-Err($e) {
 
 # Send all transactions from one flush in a single POST (far less self-traffic
 # than one request each).
+# POST bytes to the collector with a raw HttpWebRequest so we control the three
+# things that make PowerShell uploads flaky against a simple server:
+#  - no Expect: 100-continue wait (a basic server never answers it),
+#  - no keep-alive reuse (the server closes each connection, which otherwise trips
+#    "a connection that was expected to be kept alive was closed by the server"),
+#  - no proxy autodetect, and accept the collector cert (it may be the MITM leaf).
+function Send-Post([string]$url, [byte[]]$bytes, [int]$timeoutSec) {
+  $req = [System.Net.HttpWebRequest]::Create($url)
+  $req.Method = 'POST'
+  $req.ContentType = 'application/json; charset=utf-8'
+  $req.KeepAlive = $false
+  $req.ProtocolVersion = [Version]'1.1'
+  try { $req.ServicePoint.Expect100Continue = $false } catch {}
+  $req.Proxy = $null
+  $req.Timeout = $timeoutSec * 1000
+  $req.ReadWriteTimeout = $timeoutSec * 1000
+  try { $req.Headers.Add($script:UploadMark, '1') } catch {}
+  $req.ContentLength = $bytes.Length
+  $rs = $req.GetRequestStream()
+  try { $rs.Write($bytes, 0, $bytes.Length) } finally { $rs.Close() }
+  $resp = $req.GetResponse()
+  $resp.Close()
+}
+
 function Send-Batch($list) {
   if (-not $list -or $list.Count -eq 0) { return }
   $items = @()
@@ -1192,8 +1216,7 @@ function Send-Batch($list) {
     # Pre-encode to UTF-8: PowerShell 5.1 does not reliably encode string bodies
     # as UTF-8, which would corrupt every non-ASCII byte of a binary capture.
     $bytes = [Text.Encoding]::UTF8.GetBytes($body)
-    Invoke-RestMethod -Method Post -Uri "$script:ServerBase/api/ingest" -Body $bytes `
-      -ContentType 'application/json; charset=utf-8' -Headers @{ $script:UploadMark = '1' } -TimeoutSec 10 | Out-Null
+    Send-Post "$script:ServerBase/api/ingest" $bytes 20
     $first = ($script:UploadOk -eq 0)
     $script:UploadOk += $list.Count
     if ($first)            { Ok "server upload working (first batch sent, total: $script:UploadOk)" }
@@ -1220,9 +1243,7 @@ function Send-Batch($list) {
 function Register-WithServer {
   $body = @{ "$script:UploadSentinel" = 1; agentId = $script:AgentId; agentName = $script:AgentName; machine = $env:COMPUTERNAME }
   try {
-    Invoke-RestMethod -Method Post -Uri "$script:ServerBase/api/agent" `
-      -Body ($body | ConvertTo-Json -Compress) -ContentType 'application/json' `
-      -Headers @{ $script:UploadMark = '1' } -TimeoutSec 8 | Out-Null
+    Send-Post "$script:ServerBase/api/agent" ([Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Compress))) 10
     return $true
   } catch { $script:RegErr = Expl-Err $_.Exception; return $false }
 }
