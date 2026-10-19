@@ -19,7 +19,7 @@
          - pushes the rules profile over the Global\HttpDebuggerIpcSettings
            channel so the engine builds a live profile (the service never loads
            settings.xml from disk into the engine; only this IPC push does), and
-         - pushes EngineCommand selectors 4, 9, 11, 2 (install CA, build the
+         - pushes EngineCommand selectors 3, 9, 11, 2 (install CA, build the
            80/443 rules, apply the profile, user handshake).
        Neither the mutex nor the commands alone start capture; together they do.
     6. Follows the HttpTransaction shared-memory ring and decodes each record.
@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.17.10'
+$NetSnitchBuild = '2026.10.20.11'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -336,12 +336,16 @@ public static class HttpIpc
         byte[] uext = new byte[8 + ub.Length];
         BitConverter.GetBytes((uint)ub.Length).CopyTo(uext, 0);
         ub.CopyTo(uext, 4);
+        // Match the UI exactly. The UI only ever issues selectors 2,3,9,10,11:
+        // 3 = install/verify the CA (cleanup old, reimport, verify, set the engine
+        // SSL-ready flag) - the UI never uses selector 4. 9 = start (80/443 rules),
+        // 11 = apply the profile, 2 = user handshake.
         string ss = PushSettings(settingsXml); System.Threading.Thread.Sleep(700); // load rules profile (enables apply + SSL decrypt)
-        string s4 = Push(4, new byte[4]);  System.Threading.Thread.Sleep(1200); // install CA (HTTPS) first
+        string s3 = Push(3, new byte[4]);  System.Threading.Thread.Sleep(1200); // install + verify CA (HTTPS), as the UI does
         string s9 = Push(9, new byte[4]);  System.Threading.Thread.Sleep(300);  // build 80/443 rules
         string s11 = Push(11, new byte[4]); System.Threading.Thread.Sleep(300); // apply/activate the profile
         string s2 = Push(2, uext);         System.Threading.Thread.Sleep(300);  // user handshake
-        return "settings " + ss + "; " + s4 + "; " + s9 + "; " + s11 + "; " + s2;
+        return "settings " + ss + "; " + s3 + "; " + s9 + "; " + s11 + "; " + s2;
     }
 
     // Every meaningful field in a record (the metadata strings: user, process,
@@ -639,9 +643,9 @@ if (-not $NoInstall) {
 
 # ---------------------------------------------------------------------------
 # Arm capture headlessly: hold the UI mutex, push the rules profile over
-# IpcSettings, then push EngineCommand 4,9,11,2.
+# IpcSettings, then push EngineCommand 3,9,11,2.
 # ---------------------------------------------------------------------------
-Step 'Arming capture (mutex + IpcSettings profile + EngineCommand 4,9,11,2)'
+Step 'Arming capture (mutex + IpcSettings profile + EngineCommand 3,9,11,2)'
 $mutexName = 'Global\HttpDebuggerUiStarted'
 try { $mutex = [System.Threading.Mutex]::OpenExisting($mutexName) }
 catch { $cn = $false; $mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$cn) }
