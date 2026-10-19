@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.13'
+$NetSnitchBuild = '2026.10.20.14'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -1236,6 +1236,22 @@ if ($Server) {
       -bor [Net.SecurityProtocolType]::Tls12
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13 } catch {}
   } catch {}
+  # Kill the classic .NET upload stalls. These, not the server, are what make a
+  # POST "time out":
+  #  - Expect: 100-continue - .NET sends POST headers and then WAITS for a "100
+  #    Continue" before sending the body. Simple servers (our Python collector)
+  #    never send it, so the body is never sent and the request hangs. Turn it off
+  #    so the body goes out with the headers.
+  #  - Proxy autodetect (WPAD) can block for seconds before every request; we talk
+  #    straight to the collector, so use no proxy.
+  #  - Certificate chain / revocation (OCSP/CRL) lookups - when the collector is
+  #    reached over HTTPS through the capture's own MITM leaf, these can hang or
+  #    fail; we are uploading to our own collector, so accept the presented cert.
+  try { [Net.ServicePointManager]::Expect100Continue = $false } catch {}
+  try { [Net.ServicePointManager]::CheckCertificateRevocationList = $false } catch {}
+  try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { param($s,$c,$h,$e) $true } } catch {}
+  try { [Net.ServicePointManager]::DefaultConnectionLimit = 64 } catch {}
+  try { [Net.WebRequest]::DefaultWebProxy = (New-Object Net.WebProxy) } catch {}
   $script:ServerBase = $Server.TrimEnd('/')
   try { $script:ServerHost = ([Uri]$Server).Host; $script:ServerPort = ([Uri]$Server).Port }
   catch { $script:ServerHost = ''; $script:ServerPort = 443 }
