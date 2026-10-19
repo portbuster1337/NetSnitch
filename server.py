@@ -405,8 +405,51 @@ OPEN_PATHS = ("/login", "/api/ingest", "/api/agent")   # agent push + login
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Speak HTTP/1.1 so proxies (the capture's own MITM, cloudflared) keep the
+    # connection framed correctly and 100-continue is handled for us. Every
+    # response below sends an explicit Content-Length, so keep-alive is safe.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, *a):
         pass
+
+    def _read_body(self):
+        # Read the request body regardless of how the client or any intermediary
+        # framed it. An agent POST that crosses the capture MITM and then a
+        # cloudflare tunnel frequently arrives chunked (Transfer-Encoding: chunked,
+        # no Content-Length); reading only Content-Length would silently drop the
+        # whole batch and still answer 200, which looks like "upload does nothing".
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            out = []
+            total = 0
+            while True:
+                line = self.rfile.readline(65537)
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    size = int(line.split(b";", 1)[0], 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    # consume trailers up to the terminating blank line
+                    while True:
+                        t = self.rfile.readline(65537)
+                        if t in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                chunk = self.rfile.read(size)
+                out.append(chunk)
+                total += len(chunk)
+                self.rfile.read(2)                 # trailing CRLF after each chunk
+                if total > 200 * 1024 * 1024:       # hard cap, never grow unbounded
+                    break
+            return b"".join(out)
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
 
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         if isinstance(body, str):
@@ -493,8 +536,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b""
+        raw = self._read_body()
         if path == "/login":
             pw = (parse_qs(raw.decode("utf-8", "ignore")).get("password") or [""])[0]
             if pw and PASSWORD and hmac.compare_digest(pw, PASSWORD):

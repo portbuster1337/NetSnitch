@@ -141,7 +141,7 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
 }
 
 # Build marker - bump on every change so it is obvious which copy is running.
-$NetSnitchBuild = '2026.10.20.19'
+$NetSnitchBuild = '2026.10.20.20'
 Write-Host ''
 Write-Host "NetSnitch  (build $NetSnitchBuild)" -ForegroundColor Cyan
 
@@ -180,6 +180,7 @@ public static class HttpIpc
     [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Ansi)]
     static extern IntPtr OpenEventA(uint access, bool inherit, string name);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetEvent(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr h, uint ms);
 
     const uint FILE_MAP_READ   = 0x0004;
     const uint FILE_MAP_WRITE  = 0x0002;
@@ -211,7 +212,7 @@ public static class HttpIpc
 
     public class Ring {
         public string Base, DataName;
-        public IntPtr Mem, Data, EvtAvai;
+        public IntPtr Mem, Data, EvtAvai, EvtFilled;
         public Header H = new Header();
         public long DataBytes;
         public bool DataWritable;
@@ -259,6 +260,11 @@ public static class HttpIpc
         // when the ring looks full and the UI signals it after draining; we must do
         // the same or the service backpressures and the real traffic slows down.
         r.EvtAvai = OpenEventA(EVENT_ALL, false, b + "_evt_avai");
+        // The producer->consumer "record ready" event. The UI consumer blocks on this
+        // (object+0x54) and only wakes when the service publishes a record, instead of
+        // polling. We do the same: it wakes us instantly on new traffic (low latency)
+        // and lets the pump sit idle at ~0% CPU when nothing is happening.
+        r.EvtFilled = OpenEventA(EVENT_ALL, false, b + "_evt_filled");
         return r;
     }
 
@@ -624,6 +630,7 @@ public static class HttpIpc
     static uint RU(IntPtr p, long o) { return (uint)Marshal.ReadInt32(p, (int)o); }
 
     static IntPtr _evtAvai = IntPtr.Zero;
+    static IntPtr _evtFilled = IntPtr.Zero;
     static IntPtr _memHdr  = IntPtr.Zero;
     static bool   _freeSlots;
     static long   _freed;
@@ -643,10 +650,11 @@ public static class HttpIpc
             if (wc != rc) Marshal.WriteInt32(_memHdr, 8, wc);
         } catch { }
     }
-    public static void StartPump(IntPtr data, int cap, int stride, long dataBytes, int sleepMs, IntPtr evtAvai, IntPtr memHdr, bool freeSlots) {
+    public static void StartPump(IntPtr data, int cap, int stride, long dataBytes, int sleepMs, IntPtr evtAvai, IntPtr memHdr, bool freeSlots, IntPtr evtFilled) {
         _slotSig = new uint[cap];
         _pumpRun = true;
         _evtAvai = evtAvai;
+        _evtFilled = evtFilled;
         _memHdr  = memHdr;
         _freeSlots = freeSlots;
         PumpScan(data, cap, stride, dataBytes, true);   // prime: skip the pre-attach backlog
@@ -654,16 +662,14 @@ public static class HttpIpc
         AdvanceReadCursor();
         if (_evtAvai != IntPtr.Zero) { try { SetEvent(_evtAvai); } catch { } }
         _pumpThread = new Thread(delegate() {
-            // Run at Normal, the same class as the capture service. Freeing ring slots
-            // must keep pace with the service producing them; a below-normal pump falls
-            // behind under load, the ring fills, and the producer blocks ~500ms per
-            // record (the few-second stalls). At equal priority the two cooperate: we
-            // drain, then yield (Sleep(0)) so the service runs, then drain again.
+            // Run at Normal, the same class as the capture service, so freeing ring slots
+            // keeps pace with the service producing them. (A below-normal pump fell behind
+            // under load, the ring filled, and the producer blocked ~500ms per record -
+            // the earlier few-second stalls.)
             try { Thread.CurrentThread.Priority = ThreadPriority.Normal; } catch { }
             timeBeginPeriod(1);
             try {
                 while (_pumpRun) {
-                    long before = Interlocked.Read(ref _freed);
                     PumpScan(data, cap, stride, dataBytes, false);
                     // Freeing ready slots (in PumpScan) is what stops the service's
                     // producer from blocking up to 500ms per record on a full ring - the
@@ -672,11 +678,13 @@ public static class HttpIpc
                     // producer that is already parked on the event.
                     AdvanceReadCursor();
                     if (_evtAvai != IntPtr.Zero) { try { SetEvent(_evtAvai); } catch { } }
-                    // Adaptive pacing: while a burst is flowing (we just freed slots),
-                    // keep draining with only a yield so the ring never backs up; when
-                    // idle, sleep a tick so we barely touch the CPU.
-                    bool busy = Interlocked.Read(ref _freed) != before;
-                    if (busy) Thread.Sleep(0);
+                    // Block on the service's "record ready" event instead of busy-polling,
+                    // exactly like the UI consumer (which waits on object+0x54). It wakes
+                    // us the instant a record is published - lower latency than a fixed
+                    // tick - and lets the pump sit at ~0% CPU when idle rather than
+                    // re-scanning all 128 slots every millisecond. The short timeout is
+                    // just a safety net so we re-scan even if a signal is ever missed.
+                    if (_evtFilled != IntPtr.Zero) WaitForSingleObject(_evtFilled, (uint)(sleepMs > 0 ? sleepMs : 15));
                     else if (sleepMs > 0) Thread.Sleep(sleepMs);
                 }
             }
@@ -737,6 +745,8 @@ public static class HttpIpc
 
     public static void StopPump() {
         _pumpRun = false;
+        // Wake the pump if it is parked on the "record ready" event so it exits at once.
+        if (_evtFilled != IntPtr.Zero) { try { SetEvent(_evtFilled); } catch { } }
         try { if (_pumpThread != null) _pumpThread.Join(500); } catch { }
     }
 
@@ -1540,7 +1550,7 @@ try { [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = [System.
 # uploads finished transactions, so heavy traffic no longer bottlenecks on
 # per-record script work the way it did before.
 [HttpIpc]::Configure($script:Settle, $script:Grace, $env:USERNAME, [bool]$DebugRing)
-[HttpIpc]::StartPump($ring.Data, $cap, $stride, $dbytes, 1, $ring.EvtAvai, $ring.Mem, $ring.DataWritable)
+[HttpIpc]::StartPump($ring.Data, $cap, $stride, $dbytes, 15, $ring.EvtAvai, $ring.Mem, $ring.DataWritable, $ring.EvtFilled)
 $dbgBeat = [DateTime]::UtcNow
 try {
   while ([DateTime]::UtcNow -lt $stop) {
